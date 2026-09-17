@@ -42,15 +42,16 @@ use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
-    Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
-    Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Edges,
-    Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    ParentElement, Pixels, ScaledPixels, ScrollHandle, ShapedLine, SharedString, Size,
-    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun,
-    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, div, fill, outline, pattern_slash,
-    point, px, quad, relative, size, solid_background, transparent_black, underline_y_offset,
+    Action, Along, AnimationExt, AnyElement, App, AppContext, AvailableSpace,
+    Axis as ScrollbarAxis, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners,
+    CursorStyle, DispatchPhase, Edges, Element, ElementInputHandler, Entity, Focusable as _, Font,
+    FontId, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
+    IntoElement, IsZero, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, ParentElement, Pixels, ScaledPixels, ScrollHandle, ShapedLine,
+    SharedString, Size, SpringAnimation, SpringConfig, StatefulInteractiveElement, Style, Styled,
+    StyledText, TaskExt, TextAlign, TextRun, TextStyleRefinement, UnderlineStyle, WeakEntity,
+    Window, canvas, div, fill, outline, pattern_slash, point, px, quad, relative, size,
+    solid_background, transparent_black, underline_y_offset,
 };
 use itertools::Itertools;
 use language::{
@@ -1598,13 +1599,7 @@ impl EditorElement {
             }
         }
 
-        if !snapshot.mode.is_full()
-            || minimap_width.is_zero()
-            || matches!(
-                minimap_settings.show,
-                ShowMinimap::Auto if scrollbar_layout.is_none_or(|layout| !layout.visible)
-            )
-        {
+        if !snapshot.mode.is_full() || minimap_width.is_zero() {
             return None;
         }
 
@@ -1633,7 +1628,7 @@ impl EditorElement {
             MinimapThumb::Hover => thumb_state.is_some(),
         };
 
-        let minimap_bounds = Bounds::from_anchor_and_size(
+        let hover_bounds = Bounds::from_anchor_and_size(
             gpui::Anchor::TopRight,
             top_right_anchor,
             size(minimap_width, editor_bounds.size.height),
@@ -1648,7 +1643,7 @@ impl EditorElement {
             window,
             cx,
         );
-        let minimap_height = minimap_bounds.size.height;
+        let minimap_height = hover_bounds.size.height;
 
         let visible_editor_lines = (editor_bounds.size.height / line_height) as f64;
         let total_editor_lines = (scroll_range.height / line_height) as f64;
@@ -1661,6 +1656,17 @@ impl EditorElement {
             scroll_position,
         );
 
+        let document_lines = snapshot.max_point().row().next_row().as_f64();
+        let content_height = Pixels::from(
+            (document_lines - minimap_scroll_top).max(0.) * f64::from(minimap_line_height),
+        )
+        .min(minimap_height);
+        let minimap_bounds = Bounds {
+            size: size(minimap_width, content_height),
+            ..hover_bounds
+        };
+
+        let hover_hitbox = window.insert_hitbox(hover_bounds, HitboxBehavior::Normal);
         let layout = ScrollbarLayout::for_minimap(
             window.insert_hitbox(minimap_bounds, HitboxBehavior::Normal),
             visible_editor_lines,
@@ -1679,14 +1685,61 @@ impl EditorElement {
         // Required for the drop shadow to be visible
         const PADDING_OFFSET: Pixels = px(4.);
 
-        let mut minimap = div()
-            .size_full()
+        let hovered = window.with_global_id("hover-state".into(), |global_id, window| {
+            window.with_element_state(
+                global_id,
+                |hovered: Option<Rc<Cell<MinimapHoverState>>>, _| {
+                    let hovered = hovered.unwrap_or_default();
+                    (hovered.clone(), hovered)
+                },
+            )
+        });
+        let visible = minimap_settings.show != ShowMinimap::Auto
+            || hovered.get().hovered
+            || self.editor.read(cx).scroll_manager.is_dragging_minimap();
+        let thumb_layout = layout.clone();
+        let minimap_content = div()
+            .relative()
+            .w_full()
+            .h(content_height)
             .shadow_xs()
             .px(PADDING_OFFSET)
             .child(minimap_editor)
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, cx| {
+                        Self::paint_minimap_thumb(
+                            &thumb_layout,
+                            minimap_settings.thumb_border,
+                            window,
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
+        let mut minimap = div()
+            .size_full()
+            .with_spring(
+                "fade",
+                SpringAnimation::new(SpringConfig::new(3600., 120., 1.)).to(if visible {
+                    1.
+                } else {
+                    0.
+                }),
+                move |element, opacity| {
+                    element
+                        .opacity(opacity.clamp(0., 1.))
+                        .when(opacity > 0., |element| element.child(minimap_content))
+                },
+            )
             .into_any_element();
 
-        let extended_bounds = minimap_bounds.extend(Edges {
+        let extended_bounds = hover_bounds.extend(Edges {
             right: PADDING_OFFSET,
             left: PADDING_OFFSET,
             ..Default::default()
@@ -1698,8 +1751,9 @@ impl EditorElement {
 
         Some(MinimapLayout {
             minimap,
+            hover_state: hovered,
+            hover_hitbox,
             thumb_layout: layout,
-            thumb_border_style: minimap_settings.thumb_border,
             minimap_line_height,
             minimap_scroll_top,
             max_scroll_top: total_editor_lines,
@@ -1721,35 +1775,28 @@ impl EditorElement {
     fn get_minimap_width(
         &self,
         minimap_settings: &Minimap,
-        scrollbars_shown: bool,
         text_width: Pixels,
-        em_width: Pixels,
-        font_size: Pixels,
-        rem_size: Pixels,
+        window: &Window,
         cx: &App,
     ) -> Option<Pixels> {
-        if minimap_settings.show == ShowMinimap::Auto && !scrollbars_shown {
-            return None;
+        let minimap_editor = self.editor.read(cx).minimap()?;
+        let text_style = minimap_editor.read(cx).create_style(cx).text;
+        let font_id = window.text_system().resolve_font(&text_style.font());
+        let minimap_column_width = window
+            .text_system()
+            .em_advance(font_id, text_style.font_size.to_pixels(window.rem_size()))
+            .log_err()?;
+        let configured_width =
+            minimap_column_width * minimap_settings.max_width_columns.get() as f32;
+
+        if minimap_settings.show == ShowMinimap::Auto {
+            Some(configured_width.min(text_width.max(Pixels::ZERO)))
+        } else {
+            let minimap_width =
+                (text_width * MinimapLayout::MINIMAP_WIDTH_PCT).min(configured_width);
+            (minimap_width >= minimap_column_width * MinimapLayout::MINIMAP_MIN_WIDTH_COLUMNS)
+                .then_some(minimap_width)
         }
-
-        let minimap_font_size = self.editor.read_with(cx, |editor, cx| {
-            editor.minimap().map(|minimap_editor| {
-                minimap_editor
-                    .read(cx)
-                    .text_style_refinement
-                    .as_ref()
-                    .and_then(|refinement| refinement.font_size)
-                    .unwrap_or(MINIMAP_FONT_SIZE)
-            })
-        })?;
-
-        let minimap_em_width = em_width * (minimap_font_size.to_pixels(rem_size) / font_size);
-
-        let minimap_width = (text_width * MinimapLayout::MINIMAP_WIDTH_PCT)
-            .min(minimap_em_width * minimap_settings.max_width_columns.get() as f32);
-
-        (minimap_width >= minimap_em_width * MinimapLayout::MINIMAP_MIN_WIDTH_COLUMNS)
-            .then_some(minimap_width)
     }
 
     fn prepaint_crease_toggles(
@@ -6711,58 +6758,97 @@ impl EditorElement {
         }
     }
 
+    fn paint_minimap_thumb(
+        layout: &ScrollbarLayout,
+        thumb_border_style: MinimapThumbBorder,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(thumb_bounds) = layout.thumb_bounds {
+            let minimap_thumb_color = match layout.thumb_state {
+                ScrollbarThumbState::Idle | ScrollbarThumbState::Hovered => {
+                    cx.theme().colors().minimap_thumb_hover_background
+                }
+                ScrollbarThumbState::Dragging => {
+                    cx.theme().colors().minimap_thumb_active_background
+                }
+            };
+            let minimap_thumb_border = match thumb_border_style {
+                MinimapThumbBorder::Full => Edges::all(ScrollbarLayout::BORDER_WIDTH),
+                MinimapThumbBorder::LeftOnly => Edges {
+                    left: ScrollbarLayout::BORDER_WIDTH,
+                    ..Default::default()
+                },
+                MinimapThumbBorder::LeftOpen => Edges {
+                    right: ScrollbarLayout::BORDER_WIDTH,
+                    top: ScrollbarLayout::BORDER_WIDTH,
+                    bottom: ScrollbarLayout::BORDER_WIDTH,
+                    ..Default::default()
+                },
+                MinimapThumbBorder::RightOpen => Edges {
+                    left: ScrollbarLayout::BORDER_WIDTH,
+                    top: ScrollbarLayout::BORDER_WIDTH,
+                    bottom: ScrollbarLayout::BORDER_WIDTH,
+                    ..Default::default()
+                },
+                MinimapThumbBorder::None => Default::default(),
+            };
+
+            window.with_content_mask(
+                Some(ContentMask {
+                    bounds: layout.hitbox.bounds,
+                }),
+                |window| {
+                    window.paint_quad(quad(
+                        thumb_bounds,
+                        Corners::default(),
+                        minimap_thumb_color,
+                        minimap_thumb_border,
+                        cx.theme().colors().minimap_thumb_border,
+                        BorderStyle::Solid,
+                    ));
+                },
+            );
+        }
+    }
+
     fn paint_minimap(&self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
+        let minimap_height = layout.hitbox.size.height;
         if let Some(mut layout) = layout.minimap.take() {
             let minimap_hitbox = layout.thumb_layout.hitbox.clone();
             let dragging_minimap = self.editor.read(cx).scroll_manager.is_dragging_minimap();
 
+            let mut hover_state = layout.hover_state.get();
+            let hovered = layout.hover_hitbox.is_hovered(window);
+            if !hover_state.mouse_exited
+                && !window.last_input_was_keyboard()
+                && hover_state.hovered != hovered
+            {
+                hover_state.hovered = hovered;
+                layout.hover_state.set(hover_state);
+                let editor = self.editor.clone();
+                window.defer(cx, move |_, cx| editor.update(cx, |_, cx| cx.notify()));
+            }
+
+            window.on_mouse_event({
+                let hover_state = layout.hover_state.clone();
+                let editor = self.editor.clone();
+                move |_: &gpui::MouseExitEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture {
+                        let previous = hover_state.replace(MinimapHoverState {
+                            hovered: false,
+                            mouse_exited: true,
+                        });
+                        if previous.hovered {
+                            editor.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                }
+            });
+
             window.paint_layer(layout.thumb_layout.hitbox.bounds, |window| {
                 window.with_element_namespace("minimap", |window| {
                     layout.minimap.paint(window, cx);
-                    if let Some(thumb_bounds) = layout.thumb_layout.thumb_bounds {
-                        let minimap_thumb_color = match layout.thumb_layout.thumb_state {
-                            ScrollbarThumbState::Idle => {
-                                cx.theme().colors().minimap_thumb_background
-                            }
-                            ScrollbarThumbState::Hovered => {
-                                cx.theme().colors().minimap_thumb_hover_background
-                            }
-                            ScrollbarThumbState::Dragging => {
-                                cx.theme().colors().minimap_thumb_active_background
-                            }
-                        };
-                        let minimap_thumb_border = match layout.thumb_border_style {
-                            MinimapThumbBorder::Full => Edges::all(ScrollbarLayout::BORDER_WIDTH),
-                            MinimapThumbBorder::LeftOnly => Edges {
-                                left: ScrollbarLayout::BORDER_WIDTH,
-                                ..Default::default()
-                            },
-                            MinimapThumbBorder::LeftOpen => Edges {
-                                right: ScrollbarLayout::BORDER_WIDTH,
-                                top: ScrollbarLayout::BORDER_WIDTH,
-                                bottom: ScrollbarLayout::BORDER_WIDTH,
-                                ..Default::default()
-                            },
-                            MinimapThumbBorder::RightOpen => Edges {
-                                left: ScrollbarLayout::BORDER_WIDTH,
-                                top: ScrollbarLayout::BORDER_WIDTH,
-                                bottom: ScrollbarLayout::BORDER_WIDTH,
-                                ..Default::default()
-                            },
-                            MinimapThumbBorder::None => Default::default(),
-                        };
-
-                        window.paint_layer(minimap_hitbox.bounds, |window| {
-                            window.paint_quad(quad(
-                                thumb_bounds,
-                                Corners::default(),
-                                minimap_thumb_color,
-                                minimap_thumb_border,
-                                cx.theme().colors().minimap_thumb_border,
-                                BorderStyle::Solid,
-                            ));
-                        });
-                    }
                 });
             });
 
@@ -6773,10 +6859,9 @@ impl EditorElement {
             }
 
             let minimap_axis = ScrollbarAxis::Vertical;
-            let pixels_per_line = Pixels::from(
-                ScrollPixelOffset::from(minimap_hitbox.size.height) / layout.max_scroll_top,
-            )
-            .min(layout.minimap_line_height);
+            let pixels_per_line =
+                Pixels::from(ScrollPixelOffset::from(minimap_height) / layout.max_scroll_top)
+                    .min(layout.minimap_line_height);
 
             let mut mouse_position = window.mouse_position();
 
@@ -6784,9 +6869,18 @@ impl EditorElement {
                 let editor = self.editor.clone();
 
                 let minimap_hitbox = minimap_hitbox.clone();
+                let hover_hitbox = layout.hover_hitbox.clone();
+                let hover_state = layout.hover_state.clone();
 
                 move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase == DispatchPhase::Capture {
+                        let state = MinimapHoverState {
+                            hovered: hover_hitbox.is_hovered(window),
+                            mouse_exited: false,
+                        };
+                        if hover_state.replace(state) != state {
+                            editor.update(cx, |_, cx| cx.notify());
+                        }
                         return;
                     }
 
@@ -8632,16 +8726,18 @@ impl Element for EditorElement {
                     let minimap_width = self
                         .get_minimap_width(
                             &settings.minimap,
-                            scrollbars_shown,
-                            text_width,
-                            em_width,
-                            font_size,
-                            rem_size,
+                            text_width - vertical_scrollbar_width,
+                            window,
                             cx,
                         )
                         .unwrap_or_default();
 
-                    let right_margin = minimap_width + vertical_scrollbar_width;
+                    let right_margin = vertical_scrollbar_width
+                        + if settings.minimap.show == ShowMinimap::Auto {
+                            Pixels::ZERO
+                        } else {
+                            minimap_width
+                        };
 
                     let extended_right = 2 * em_width + right_margin;
                     let editor_width = text_width - gutter_dimensions.margin - extended_right;
@@ -10706,12 +10802,20 @@ impl ScrollbarLayout {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MinimapHoverState {
+    hovered: bool,
+    // MouseExited can arrive without a final move, leaving the window's last mouse position inside.
+    mouse_exited: bool,
+}
+
 struct MinimapLayout {
     pub minimap: AnyElement,
+    pub hover_state: Rc<Cell<MinimapHoverState>>,
+    pub hover_hitbox: Hitbox,
     pub thumb_layout: ScrollbarLayout,
     pub minimap_scroll_top: ScrollOffset,
     pub minimap_line_height: Pixels,
-    pub thumb_border_style: MinimapThumbBorder,
     pub max_scroll_top: ScrollOffset,
 }
 
@@ -13597,6 +13701,279 @@ mod tests {
             assert_eq!(out[2].color, text_color);
             assert_eq!(out[3].color, adjusted_bg1);
         }
+    }
+
+    fn minimap_background(
+        editor: &Entity<Editor>,
+        cx: &mut VisualTestContext,
+    ) -> Option<gpui::Quad> {
+        cx.update(|window, cx| {
+            let minimap = editor.read(cx).minimap()?;
+            let bounds = minimap.read(cx).last_bounds?.scale(window.scale_factor());
+            let background = minimap.read(cx).create_style(cx).background;
+            window.painted_quads().into_iter().find(|quad| {
+                (quad.bounds.origin.x - bounds.origin.x).as_f32().abs() < 1.
+                    && (quad.bounds.size.width - bounds.size.width).as_f32().abs() < 1.
+                    && (quad.bounds.size.height - bounds.size.height)
+                        .as_f32()
+                        .abs()
+                        < 1.
+                    && quad.background.as_solid().is_some_and(|color| {
+                        color.h == background.h
+                            && color.s == background.s
+                            && color.l == background.l
+                    })
+            })
+        })
+    }
+
+    fn advance_minimap_animation(cx: &mut VisualTestContext, duration: Duration) {
+        cx.executor().advance_clock(duration);
+        cx.update(|window, cx| window.simulate_next_frame(cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn test_minimap_auto_width_and_overlay(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        cx.update(|cx| {
+            let mut settings = EditorSettings::get_global(cx).clone();
+            settings.minimap.show = ShowMinimap::Auto;
+            settings.scrollbar.show = ShowScrollbar::Never;
+            EditorSettings::override_global(settings, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&"a ".repeat(200), cx);
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
+            editor
+        });
+        let editor = window.root(cx).expect("editor window");
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        cx.update(|window, cx| {
+            let element = EditorElement::new(&editor, style.clone());
+            let mut settings = EditorSettings::get_global(cx).minimap;
+            let width = element
+                .get_minimap_width(&settings, px(1000.), window, cx)
+                .expect("enabled minimap");
+            assert!(width > px(20.));
+            assert_eq!(
+                element.get_minimap_width(&settings, px(500.), window, cx),
+                Some(width)
+            );
+            assert_eq!(
+                element.get_minimap_width(&settings, px(10.), window, cx),
+                Some(px(10.))
+            );
+            assert_eq!(
+                element.get_minimap_width(&settings, px(-10.), window, cx),
+                Some(Pixels::ZERO)
+            );
+            settings.max_width_columns = NonZeroU32::new(10).expect("nonzero columns");
+            assert_eq!(
+                element.get_minimap_width(&settings, px(500.), window, cx),
+                Some(width / 8.)
+            );
+            settings.show = ShowMinimap::Always;
+            settings.max_width_columns = NonZeroU32::new(80).expect("nonzero columns");
+            assert_eq!(
+                element.get_minimap_width(&settings, px(500.), window, cx),
+                Some(width.min(px(75.)))
+            );
+        });
+
+        let (_, auto_layout) = cx.draw(Default::default(), size(px(500.), px(300.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.last_right_margin()),
+            Pixels::ZERO
+        );
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_minimap(&crate::ToggleMinimap, window, cx)
+            });
+        });
+        let (_, hidden_layout) = cx.draw(Default::default(), size(px(500.), px(300.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert_eq!(
+            auto_layout.position_map.snapshot.max_point(),
+            hidden_layout.position_map.snapshot.max_point()
+        );
+        assert!(editor.read_with(cx, |editor, _| editor.minimap().is_none()));
+    }
+
+    #[gpui::test]
+    fn test_minimap_auto_fades_on_hover_and_stays_visible_while_dragging(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        cx.update(|cx| {
+            let mut settings = EditorSettings::get_global(cx).clone();
+            settings.minimap.show = ShowMinimap::Auto;
+            settings.scrollbar.show = ShowScrollbar::Never;
+            EditorSettings::override_global(settings, cx);
+            let mut theme = cx.theme().as_ref().clone();
+            theme.styles.colors.minimap_thumb_background = gpui::rgba(0xc8ccd44c).into();
+            theme.styles.colors.minimap_thumb_hover_background = gpui::rgba(0x363c46b3).into();
+            theme.styles.colors.minimap_thumb_active_background = gpui::rgba(0xc8ccd44c).into();
+            theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        });
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&"hello\n".repeat(100), cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let editor = window.root(cx).expect("editor window");
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let assert_thumb_color = |dragging: bool, cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                let colors = cx.theme().colors();
+                let expected = if dragging {
+                    colors.minimap_thumb_active_background
+                } else {
+                    colors.minimap_thumb_hover_background
+                };
+                assert!(
+                    window
+                        .painted_quads()
+                        .iter()
+                        .any(|quad| quad.background == expected.into()),
+                    "expected thumb color {expected:?}"
+                );
+            });
+        };
+        cx.run_until_parked();
+        assert!(minimap_background(&editor, cx).is_none());
+        let hover_position =
+            cx.update(|window, _| point(window.viewport_size().width - px(20.), px(20.)));
+        cx.simulate_mouse_move(hover_position, None, Default::default());
+        advance_minimap_animation(cx, Duration::from_millis(50));
+        let fading_in = minimap_background(&editor, cx).expect("fading minimap background");
+        let fading_in_alpha = fading_in.background.as_solid().expect("solid background").a;
+        assert!(fading_in_alpha > 0. && fading_in_alpha < 0.7);
+        advance_minimap_animation(cx, Duration::from_millis(200));
+        let visible = minimap_background(&editor, cx).expect("visible minimap");
+        assert_eq!(
+            visible.background.as_solid().expect("solid background").a,
+            0.7
+        );
+
+        assert_thumb_color(false, cx);
+        let outside_thumb_position = editor.read_with(cx, |editor, cx| {
+            let bounds = editor
+                .minimap()
+                .expect("enabled minimap")
+                .read(cx)
+                .last_bounds
+                .expect("rendered minimap");
+            point(hover_position.x, bounds.bottom() - px(1.))
+        });
+        cx.simulate_mouse_move(outside_thumb_position, None, Default::default());
+        assert!(matches!(
+            editor.read_with(cx, |editor, _| editor.scroll_manager.minimap_thumb_state()),
+            Some(ScrollbarThumbState::Idle)
+        ));
+        assert_thumb_color(false, cx);
+
+        cx.simulate_mouse_move(point(px(100.), px(20.)), None, Default::default());
+        advance_minimap_animation(cx, Duration::from_millis(50));
+        let fading_out = minimap_background(&editor, cx).expect("fading out minimap");
+        let fading_out_alpha = fading_out
+            .background
+            .as_solid()
+            .expect("solid background")
+            .a;
+        assert!(fading_out_alpha > 0. && fading_out_alpha < 0.7);
+        cx.simulate_mouse_move(outside_thumb_position, None, Default::default());
+        let reversed = minimap_background(&editor, cx).expect("reversed fade");
+        assert_eq!(
+            reversed.background.as_solid().expect("solid background").a,
+            fading_out_alpha
+        );
+        advance_minimap_animation(cx, Duration::from_millis(200));
+
+        assert_thumb_color(false, cx);
+        cx.simulate_mouse_move(hover_position, None, Default::default());
+        assert_thumb_color(false, cx);
+        cx.simulate_mouse_down(hover_position, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            point(px(100.), px(80.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        advance_minimap_animation(cx, Duration::from_millis(200));
+        assert!(editor.read_with(cx, |editor, _| editor.scroll_manager.is_dragging_minimap()));
+        assert_thumb_color(true, cx);
+        assert_eq!(
+            minimap_background(&editor, cx)
+                .expect("dragging minimap")
+                .background
+                .as_solid()
+                .expect("solid background")
+                .a,
+            0.7
+        );
+        cx.simulate_mouse_up(
+            point(px(100.), px(80.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        advance_minimap_animation(cx, Duration::from_millis(200));
+        assert!(!editor.read_with(cx, |editor, _| editor.scroll_manager.is_dragging_minimap()));
+        assert!(minimap_background(&editor, cx).is_none());
+
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        cx.simulate_mouse_move(hover_position, None, Default::default());
+        assert_eq!(
+            minimap_background(&editor, cx)
+                .expect("visible with reduced motion")
+                .background
+                .as_solid()
+                .expect("solid background")
+                .a,
+            0.7,
+        );
+        cx.simulate_event(gpui::MouseExitEvent {
+            position: hover_position,
+            pressed_button: None,
+            modifiers: Default::default(),
+        });
+        assert!(minimap_background(&editor, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn test_minimap_background_ends_at_file_content(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        cx.update(|cx| {
+            let mut settings = EditorSettings::get_global(cx).clone();
+            settings.minimap.show = ShowMinimap::Always;
+            EditorSettings::override_global(settings, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("first\nsecond\nthird", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let editor = window.root(cx).expect("editor window");
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        cx.run_until_parked();
+        let background = minimap_background(&editor, cx).expect("minimap background");
+        let expected_height = cx.update(|window, cx| {
+            let minimap = editor.read(cx).minimap().expect("enabled minimap");
+            let style = minimap.read(cx).create_style(cx);
+            (style.text.line_height_in_pixels(window.rem_size()) * 3.).scale(window.scale_factor())
+        });
+        assert!(
+            (background.bounds.size.height - expected_height)
+                .as_f32()
+                .abs()
+                <= 1.,
+            "expected {expected_height:?} of file content, painted {background:?}",
+        );
+        assert!(
+            background.content_mask.bounds.size.height
+                <= background.bounds.size.height + gpui::ScaledPixels(1.)
+        );
+        assert!(editor.read_with(cx, |editor, _| editor.last_right_margin()) > Pixels::ZERO);
     }
 
     #[test]
