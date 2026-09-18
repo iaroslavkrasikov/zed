@@ -186,6 +186,10 @@ impl LspInstaller for VtslsLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for VtslsLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/@vtsls/language-server".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         SERVER_NAME
     }
@@ -382,7 +386,7 @@ async fn get_cached_ts_server_binary(
             "missing executable in directory {container_dir:?}"
         );
         Ok(LanguageServerBinary {
-            path: node.binary_path().await?,
+            path: node.binary_path_if_installed().await?,
             env: None,
             arguments: typescript_server_binary_arguments(&server_path),
         })

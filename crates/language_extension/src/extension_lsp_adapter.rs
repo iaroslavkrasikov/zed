@@ -170,11 +170,12 @@ impl DynLspInstaller for ExtensionLspAdapter {
         self: Arc<Self>,
         delegate: Arc<dyn LspAdapterDelegate>,
         _: Option<Toolchain>,
-        _: LanguageServerBinaryOptions,
+        binary_options: LanguageServerBinaryOptions,
         _: OwnedMutexGuard<Option<(bool, LanguageServerBinary)>>,
         _: AsyncApp,
     ) -> LanguageServerBinaryLocations {
         async move {
+            let work_dir = self.extension.work_dir();
             let ret = maybe!(async move {
                 let language_server_status_source = delegate.status_source_id();
                 let delegate = Arc::new(WorktreeDelegateAdapter(delegate.clone())) as _;
@@ -185,6 +186,7 @@ impl DynLspInstaller for ExtensionLspAdapter {
                         self.language_name.clone(),
                         delegate,
                         language_server_status_source,
+                        binary_options,
                     )
                     .await?;
 
@@ -262,7 +264,17 @@ impl DynLspInstaller for ExtensionLspAdapter {
                 })
             })
             .await;
-            (ret, None)
+            let managed = ret
+                .as_ref()
+                .map(|binary| {
+                    binary.path.starts_with(&work_dir)
+                        || binary
+                            .arguments
+                            .iter()
+                            .any(|argument| Path::new(argument).starts_with(&work_dir))
+                })
+                .unwrap_or(true);
+            (ret, None, managed)
         }
         .boxed_local()
     }
@@ -280,6 +292,10 @@ impl DynLspInstaller for ExtensionLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for ExtensionLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        self.extension.manifest().repository.clone()
+    }
+
     fn name(&self) -> LanguageServerName {
         self.language_server_id.clone()
     }

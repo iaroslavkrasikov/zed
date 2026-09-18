@@ -304,6 +304,10 @@ impl ManifestProvider for CargoManifestProvider {
 
 #[async_trait(?Send)]
 impl LspAdapter for RustLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/rust-lang/rust-analyzer/releases".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         SERVER_NAME
     }
@@ -611,6 +615,8 @@ impl LspAdapter for RustLspAdapter {
                 LanguageServerBinaryOptions {
                     allow_path_lookup: true,
                     allow_binary_download: false,
+                    allow_binary_update: false,
+                    force_binary_update: false,
                     pre_release: false,
                 },
                 cached_binary,

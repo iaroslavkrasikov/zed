@@ -41846,12 +41846,13 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
     cx.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, &|settings: &mut SettingsContent| {
-                settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                     request_timeout: Some(BASE_TIMEOUT.as_secs()),
                     max_buffer_line_length: None,
                     button: Some(true),
                     notifications: None,
                     semantic_token_rules: None,
+                    ..Default::default()
                 });
             });
         });
@@ -41949,12 +41950,13 @@ async fn test_inlay_hints_request_timeout(cx: &mut TestAppContext) {
     cx.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                     request_timeout: Some(BASE_TIMEOUT.as_secs() * 4),
                     max_buffer_line_length: None,
                     button: Some(true),
                     notifications: None,
                     semantic_token_rules: None,
+                    ..Default::default()
                 });
             });
         });

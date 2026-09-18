@@ -122,6 +122,9 @@ impl From<settings::NodeBinarySettings> for NodeBinarySettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct GlobalLspSettings {
+    pub auto_install: bool,
+    pub auto_update: bool,
+    pub auto_start: bool,
     /// Whether to show the LSP servers button in the status bar.
     ///
     /// Default: `true`
@@ -146,6 +149,9 @@ pub struct GlobalLspSettings {
 impl Default for GlobalLspSettings {
     fn default() -> Self {
         Self {
+            auto_install: true,
+            auto_update: true,
+            auto_start: true,
             button: true,
             request_timeout: DEFAULT_LSP_REQUEST_TIMEOUT_SECS,
             max_buffer_line_length: 20_000,
@@ -155,7 +161,22 @@ impl Default for GlobalLspSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LanguageServerLifecycleSettings {
+    pub auto_install: bool,
+    pub auto_update: bool,
+    pub auto_start: bool,
+}
+
 impl GlobalLspSettings {
+    pub(crate) fn lifecycle(&self) -> LanguageServerLifecycleSettings {
+        LanguageServerLifecycleSettings {
+            auto_install: self.auto_install,
+            auto_update: self.auto_update,
+            auto_start: self.auto_start,
+        }
+    }
+
     /// Returns the timeout duration for LSP-related interactions, or Duration::ZERO if no timeout should be applied.
     /// Zero durations are treated as no timeout by language servers, so code using this in an async context can
     /// simply call unwrap_or_default.
@@ -735,26 +756,41 @@ impl Settings for ProjectSettings {
                 .map(|(key, value)| (LanguageServerName(key.into()), value))
                 .collect(),
             global_lsp_settings: GlobalLspSettings {
-                button: content
+                auto_install: project
+                    .global_lsp_settings
+                    .as_ref()
+                    .and_then(|settings| settings.auto_install)
+                    .unwrap_or(true),
+                auto_update: project
+                    .global_lsp_settings
+                    .as_ref()
+                    .and_then(|settings| settings.auto_update)
+                    .unwrap_or(true),
+                auto_start: project
+                    .global_lsp_settings
+                    .as_ref()
+                    .and_then(|settings| settings.auto_start)
+                    .unwrap_or(true),
+                button: project
                     .global_lsp_settings
                     .as_ref()
                     .unwrap()
                     .button
                     .unwrap(),
-                request_timeout: content
+                request_timeout: project
                     .global_lsp_settings
                     .as_ref()
                     .unwrap()
                     .request_timeout
                     .unwrap(),
-                max_buffer_line_length: content
+                max_buffer_line_length: project
                     .global_lsp_settings
                     .as_ref()
                     .unwrap()
                     .max_buffer_line_length
                     .unwrap(),
                 notifications: LspNotificationSettings {
-                    dismiss_timeout_ms: content
+                    dismiss_timeout_ms: project
                         .global_lsp_settings
                         .as_ref()
                         .unwrap()
@@ -763,7 +799,7 @@ impl Settings for ProjectSettings {
                         .unwrap()
                         .dismiss_timeout_ms,
                 },
-                semantic_token_rules: content
+                semantic_token_rules: project
                     .global_lsp_settings
                     .as_ref()
                     .unwrap()

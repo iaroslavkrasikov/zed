@@ -202,10 +202,6 @@ impl VsCodeSettings {
             file_finder: None,
             git: self.git_settings_content(),
             git_panel: self.git_panel_settings_content(),
-            global_lsp_settings: skip_default(GlobalLspSettingsContent {
-                semantic_token_rules: self.semantic_token_rules(),
-                ..GlobalLspSettingsContent::default()
-            }),
             helix_mode: None,
             hide_mouse: None,
             image_viewer: None,
@@ -539,6 +535,10 @@ impl VsCodeSettings {
             },
             worktree: self.worktree_settings_content(),
             lsp: Default::default(),
+            global_lsp_settings: skip_default(GlobalLspSettingsContent {
+                semantic_token_rules: self.semantic_token_rules(),
+                ..GlobalLspSettingsContent::default()
+            }),
             terminal: None,
             dap: Default::default(),
             context_servers: self.context_servers(),

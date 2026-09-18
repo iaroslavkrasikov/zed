@@ -211,6 +211,51 @@ impl NodeRuntime {
         instance
     }
 
+    pub async fn binary_path_if_installed(&self) -> Result<PathBuf> {
+        let mut state = self.0.lock().await;
+        let options = loop {
+            if let Some(options) = state.options.borrow().as_ref() {
+                break options.clone();
+            }
+            state.options.changed().await?;
+        };
+        if state.last_options.as_ref() == Some(&options)
+            && let Some(instance) = state.instance.as_ref()
+            && let Ok(path) = instance.binary_path()
+        {
+            return Ok(path);
+        }
+        if let Some((node, _)) = options.use_paths {
+            return Ok(node);
+        }
+        if options.allow_path_lookup {
+            state.shell_env_loaded.clone().await.log_err();
+            if let Ok(instance) = SystemNodeRuntime::detect().await {
+                return instance.binary_path();
+            }
+        }
+        let os = match consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            "windows" => "win",
+            other => bail!("Running on unsupported os: {other}"),
+        };
+        let arch = match consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => bail!("Running on unsupported architecture: {other}"),
+        };
+        let path = paths::data_dir()
+            .join("node")
+            .join(format!("node-{}-{os}-{arch}", ManagedNodeRuntime::VERSION))
+            .join(ManagedNodeRuntime::NODE_PATH);
+        anyhow::ensure!(
+            fs::metadata(&path).await.is_ok(),
+            "Node.js is not installed"
+        );
+        Ok(path)
+    }
+
     pub async fn binary_path(&self) -> Result<PathBuf> {
         self.instance().await.binary_path()
     }

@@ -32,6 +32,7 @@ use semver::Version;
 use settings::Settings;
 use std::{
     borrow::Cow,
+    hash::{Hash as _, Hasher as _},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, OnceLock},
     time::Duration,
@@ -69,6 +70,75 @@ pub struct WasmExtension {
     _task: Arc<Task<Result<(), gpui_tokio::JoinError>>>,
 }
 
+impl WasmExtension {
+    async fn resolve_language_server_command(
+        &self,
+        language_server_id: LanguageServerName,
+        language_name: LanguageName,
+        worktree: Arc<dyn WorktreeDelegate>,
+        status_source: EntityId,
+        allow_download: bool,
+        force_update: bool,
+    ) -> Result<Command> {
+        self.call_with_language_server_status_source(status_source, move |extension, store| {
+            async move {
+                if force_update {
+                    let state = store.data();
+                    let executor = state.executor.clone();
+                    let component = state.component.clone();
+                    let version = state.zed_api_version.clone();
+                    let host = state.host.clone();
+                    let mut fresh_store = host
+                        .create_store(
+                            state.manifest.clone(),
+                            component.clone(),
+                            version.clone(),
+                            executor.clone(),
+                        )
+                        .await?;
+                    let fresh_extension = Extension::instantiate_async(
+                        &executor,
+                        &mut fresh_store,
+                        host.release_channel,
+                        version,
+                        &component,
+                    )
+                    .await?;
+                    fresh_extension
+                        .call_init_extension(&mut fresh_store)
+                        .await?;
+                    // Extensions can cache the old executable in their instance state.
+                    *extension = fresh_extension;
+                    *store = fresh_store;
+                }
+                let resource = store.data_mut().table.push(worktree)?;
+                store.data_mut().language_server_status_source = Some(status_source);
+                store.data_mut().language_server_downloads_allowed = allow_download;
+                store.data_mut().language_server_operation_blocked = false;
+                let result = extension
+                    .call_language_server_command(
+                        store,
+                        &language_server_id,
+                        &language_name,
+                        resource,
+                    )
+                    .await;
+                store.data_mut().language_server_downloads_allowed = true;
+                let blocked =
+                    std::mem::take(&mut store.data_mut().language_server_operation_blocked);
+                match result {
+                    Ok(Ok(command)) => Ok(command.into()),
+                    _ if blocked => Err(language::LanguageServerNotInstalled.into()),
+                    Ok(Err(error)) => Err(store.data().extension_error(error)),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            .boxed()
+        })
+        .await?
+    }
+}
+
 impl Drop for WasmExtension {
     fn drop(&mut self) {
         self.tx.close_channel();
@@ -91,25 +161,118 @@ impl extension::Extension for WasmExtension {
         language_name: LanguageName,
         worktree: Arc<dyn WorktreeDelegate>,
         status_source: EntityId,
+        binary_options: lsp::LanguageServerBinaryOptions,
     ) -> Result<Command> {
-        self.call_with_language_server_status_source(status_source, move |extension, store| {
-            async move {
-                let resource = store.data_mut().table.push(worktree)?;
-                let command = extension
-                    .call_language_server_command(
-                        store,
-                        &language_server_id,
-                        &language_name,
-                        resource,
-                    )
-                    .await?
-                    .map_err(|err| store.data().extension_error(err))?;
-
-                Ok(command.into())
+        let command = self
+            .resolve_language_server_command(
+                language_server_id.clone(),
+                language_name.clone(),
+                worktree.clone(),
+                status_source,
+                false,
+                false,
+            )
+            .await;
+        let managed = |command: &Command| {
+            self.path_from_extension(&command.command)
+                .starts_with(&self.work_dir)
+                || command
+                    .args
+                    .iter()
+                    .any(|argument| Path::new(argument).starts_with(&self.work_dir))
+        };
+        if let Ok(command) = &command {
+            if !managed(command) {
+                return Ok(command.clone());
             }
-            .boxed()
-        })
-        .await?
+        }
+        let mut worktree_hash = std::collections::hash_map::DefaultHasher::new();
+        worktree.root_path().hash(&mut worktree_hash);
+        let cache_name = format!(
+            ".zed-lsp-command-{}-{:x}.json",
+            language_server_id.0.replace(['/', '\\'], "_"),
+            worktree_hash.finish(),
+        );
+        let cache_path = self.work_dir.join(cache_name);
+        let cached = self
+            .call({
+                let cache_path = cache_path.clone();
+                move |_, store| {
+                    async move {
+                        if !store.data().host.fs.is_file(&cache_path).await {
+                            return anyhow::Ok(None);
+                        }
+                        let contents = store.data().host.fs.load(&cache_path).await?;
+                        let Some(command): Option<Command> = serde_json::from_str(&contents)?
+                        else {
+                            return Ok(None);
+                        };
+                        let executable = store.data().work_dir().join(&command.command);
+                        if !store.data().host.fs.is_file(&executable).await {
+                            return anyhow::Ok(None);
+                        }
+                        for argument in &command.args {
+                            let argument = Path::new(argument);
+                            if argument.starts_with(store.data().work_dir())
+                                && !store.data().host.fs.is_file(argument).await
+                                && !store.data().host.fs.is_dir(argument).await
+                            {
+                                return Ok(None);
+                            }
+                        }
+                        anyhow::Ok(Some(command))
+                    }
+                    .boxed()
+                }
+            })
+            .await??;
+        let installed = match command {
+            Ok(command) => Some(command),
+            Err(error) if error.is::<language::LanguageServerNotInstalled>() => cached,
+            Err(error) => return Err(error),
+        };
+        if installed.is_some() && !binary_options.allow_binary_update {
+            return installed.context("missing installed language server command");
+        }
+        if installed.is_none() && !binary_options.allow_binary_download {
+            return Err(language::LanguageServerNotInstalled.into());
+        }
+        let command = match self
+            .resolve_language_server_command(
+                language_server_id,
+                language_name,
+                worktree,
+                status_source,
+                true,
+                binary_options.force_binary_update,
+            )
+            .await
+        {
+            Ok(command) => command,
+            Err(error) if !binary_options.force_binary_update && installed.is_some() => {
+                log::warn!("Failed to update extension language server: {error:#}");
+                return installed.context("missing installed language server command");
+            }
+            Err(error) => return Err(error),
+        };
+        if managed(&command) {
+            // Re-resolve commands with extension-provided environment variables instead of
+            // persisting possible credentials or silently dropping required variables.
+            let contents = serde_json::to_string(&command.env.is_empty().then_some(&command))?;
+            self.call(move |_, store| {
+                async move {
+                    store
+                        .data()
+                        .host
+                        .fs
+                        .atomic_write(cache_path, contents)
+                        .await
+                }
+                .boxed()
+            })
+            .await??;
+        }
+        Ok(command)
     }
 
     async fn language_server_initialization_options(
@@ -546,6 +709,21 @@ pub struct WasmState {
     pub host: Arc<WasmHost>,
     pub(crate) capability_granter: CapabilityGranter,
     pub(crate) language_server_status_source: Option<gpui::EntityId>,
+    language_server_downloads_allowed: bool,
+    language_server_operation_blocked: bool,
+    component: Component,
+    zed_api_version: Version,
+    executor: BackgroundExecutor,
+}
+
+impl WasmState {
+    fn ensure_language_server_download_allowed(&mut self) -> Result<()> {
+        if !self.language_server_downloads_allowed {
+            self.language_server_operation_blocked = true;
+            return Err(language::LanguageServerNotInstalled.into());
+        }
+        Ok(())
+    }
 }
 
 type MainThreadCall = Box<dyn Send + for<'a> FnOnce(&'a mut AsyncApp) -> LocalBoxFuture<'a, ()>>;
@@ -666,25 +844,15 @@ impl WasmHost {
             })
         };
 
-        let load_extension = |zed_api_version: Version, component| async move {
-            let wasi_ctx = this.build_wasi_ctx(&manifest).await?;
-            let mut store = wasmtime::Store::new(
-                &this.engine,
-                WasmState {
-                    ctx: wasi_ctx,
-                    manifest: manifest.clone(),
-                    table: ResourceTable::new(),
-                    host: this.clone(),
-                    capability_granter: CapabilityGranter::new(
-                        this.granted_capabilities.clone(),
-                        manifest.clone(),
-                    ),
-                    language_server_status_source: None,
-                },
-            );
-            // Store will yield after 1 tick, and get a new deadline of 1 tick after each yield.
-            store.set_epoch_deadline(1);
-            store.epoch_deadline_async_yield_and_update(1);
+        let load_extension = |zed_api_version: Version, component: Component| async move {
+            let mut store = this
+                .create_store(
+                    manifest.clone(),
+                    component.clone(),
+                    zed_api_version.clone(),
+                    executor.clone(),
+                )
+                .await?;
 
             let mut extension = Extension::instantiate_async(
                 &executor,
@@ -737,6 +905,37 @@ impl WasmHost {
                 _task: task,
             })
         })
+    }
+
+    async fn create_store(
+        self: &Arc<Self>,
+        manifest: Arc<ExtensionManifest>,
+        component: Component,
+        zed_api_version: Version,
+        executor: BackgroundExecutor,
+    ) -> Result<Store<WasmState>> {
+        let mut store = Store::new(
+            &self.engine,
+            WasmState {
+                ctx: self.build_wasi_ctx(&manifest).await?,
+                capability_granter: CapabilityGranter::new(
+                    self.granted_capabilities.clone(),
+                    manifest.clone(),
+                ),
+                manifest,
+                table: ResourceTable::new(),
+                host: self.clone(),
+                language_server_status_source: None,
+                language_server_downloads_allowed: true,
+                language_server_operation_blocked: false,
+                component,
+                zed_api_version,
+                executor,
+            },
+        );
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_async_yield_and_update(1);
+        Ok(store)
     }
 
     async fn build_wasi_ctx(&self, manifest: &Arc<ExtensionManifest>) -> Result<WasiCtx> {

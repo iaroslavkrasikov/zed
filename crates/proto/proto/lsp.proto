@@ -752,7 +752,35 @@ message UpdateLanguageServer {
     RegisteredForBuffer registered_for_buffer = 10;
     ServerMetadataUpdated metadata_updated = 11;
     ServerRemoved removed = 12;
+    LanguageServerManagement management = 13;
   }
+}
+
+message LanguageServerManagement {
+  string name = 1;
+  uint64 worktree_id = 2;
+  string root_path = 3;
+  bool managed = 4;
+  bool auto_update = 5;
+  optional string source = 6;
+  optional string binary_path = 7;
+  optional string error = 8;
+  enum State {
+    DISCOVERING = 0;
+    AVAILABLE = 1;
+    IDLE = 2;
+    STARTING = 3;
+    RUNNING = 4;
+    FAILED = 5;
+    DISABLED = 6;
+  }
+  State state = 9;
+}
+
+enum LanguageServerManagementAction {
+  START_SERVER = 0;
+  INSTALL_SERVER = 1;
+  UPDATE_SERVER = 2;
 }
 
 message ProgressToken {
@@ -1106,6 +1134,7 @@ message RestartLanguageServers {
   repeated uint64 buffer_ids = 2;
   repeated LanguageServerSelector only_servers = 3;
   bool all = 4;
+  optional LanguageServerManagementAction management_action = 5;
 }
 
 message StopLanguageServers {

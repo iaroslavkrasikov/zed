@@ -635,6 +635,9 @@ impl http_client::Host for WasmState {
         &mut self,
         request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<http_client::HttpResponse, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             let url = &request.url;
             let request = convert_request(&request)?;
@@ -653,6 +656,9 @@ impl http_client::Host for WasmState {
         &mut self,
         request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<Resource<ExtensionHttpResponseStream>, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         let request = convert_request(&request).into_wasmtime_result()?;
         let response = self.host.http_client.send(request);
         maybe!(async {
@@ -757,6 +763,15 @@ async fn convert_response(
 
 impl nodejs::Host for WasmState {
     async fn node_binary_path(&mut self) -> wasmtime::Result<Result<String, String>> {
+        if !self.language_server_downloads_allowed {
+            return match self.host.node_runtime.binary_path_if_installed().await {
+                Ok(path) => Ok(Ok(path.to_string_lossy().into_owned())),
+                Err(error) => {
+                    self.language_server_operation_blocked = true;
+                    Ok(Err(error.to_string()))
+                }
+            };
+        }
         self.host
             .node_runtime
             .binary_path()
@@ -769,6 +784,9 @@ impl nodejs::Host for WasmState {
         &mut self,
         package_name: String,
     ) -> wasmtime::Result<Result<String, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         self.host
             .node_runtime
             .npm_package_latest_version(&package_name)
@@ -781,12 +799,13 @@ impl nodejs::Host for WasmState {
         &mut self,
         package_name: String,
     ) -> wasmtime::Result<Result<Option<String>, String>> {
-        self.host
-            .node_runtime
-            .npm_package_installed_version(&self.work_dir(), &package_name)
-            .await
-            .map(|option| option.map(|version| version.to_string()))
-            .to_wasmtime_result()
+        node_runtime::read_package_installed_version(
+            self.work_dir().join("node_modules"),
+            &package_name,
+        )
+        .await
+        .map(|option| option.map(|version| version.to_string()))
+        .to_wasmtime_result()
     }
 
     async fn npm_install_package(
@@ -794,6 +813,9 @@ impl nodejs::Host for WasmState {
         package_name: String,
         version: String,
     ) -> wasmtime::Result<Result<(), String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         self.capability_granter
             .grant_npm_install_package(&package_name)
             .into_wasmtime_result()?;
@@ -834,6 +856,9 @@ impl github::Host for WasmState {
         repo: String,
         options: github::GithubReleaseOptions,
     ) -> wasmtime::Result<Result<github::GithubRelease, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             let release = ::http_client::github::latest_github_release(
                 &repo,
@@ -853,6 +878,9 @@ impl github::Host for WasmState {
         repo: String,
         tag: String,
     ) -> wasmtime::Result<Result<github::GithubRelease, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             let release = ::http_client::github::get_release_by_tag_name(
                 &repo,
@@ -902,6 +930,10 @@ impl process::Host for WasmState {
         &mut self,
         command: process::Command,
     ) -> wasmtime::Result<Result<process::Output, String>> {
+        let version_probe = matches!(command.args.as_slice(), [argument] if matches!(argument.as_str(), "--version" | "--help" | "-V"));
+        if !version_probe && let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             self.capability_granter
                 .grant_exec(&command.command, &command.args)?;
@@ -1057,6 +1089,9 @@ impl ExtensionImports for WasmState {
         server_name: String,
         status: LanguageServerInstallationStatus,
     ) -> wasmtime::Result<()> {
+        if !self.language_server_downloads_allowed {
+            return Ok(());
+        }
         let status = match status {
             LanguageServerInstallationStatus::CheckingForUpdate => BinaryStatus::CheckingForUpdate,
             LanguageServerInstallationStatus::Downloading => BinaryStatus::Downloading,
@@ -1079,6 +1114,9 @@ impl ExtensionImports for WasmState {
         path: String,
         file_type: DownloadedFileType,
     ) -> wasmtime::Result<Result<(), String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             let parsed_url = Url::parse(&url)?;
             self.capability_granter.grant_download_file(&parsed_url)?;

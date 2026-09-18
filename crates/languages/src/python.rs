@@ -368,6 +368,10 @@ impl TyLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for TyLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/astral-sh/ty/releases".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }
@@ -648,7 +652,7 @@ impl PyrightLspAdapter {
         let server_path = container_dir.join(Self::SERVER_PATH);
         if server_path.exists() {
             Some(LanguageServerBinary {
-                path: node.binary_path().await.log_err()?,
+                path: node.binary_path_if_installed().await.log_err()?,
                 env: None,
                 arguments: vec![server_path.into(), "--stdio".into()],
             })
@@ -661,6 +665,10 @@ impl PyrightLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for PyrightLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/pyright".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }
@@ -1812,6 +1820,10 @@ const BINARY_DIR: &str = if cfg!(target_os = "windows") {
 
 #[async_trait(?Send)]
 impl LspAdapter for PyLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://pypi.org/project/python-lsp-server/".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }
@@ -2062,7 +2074,7 @@ impl BasedPyrightLspAdapter {
         let server_path = container_dir.join(Self::SERVER_PATH);
         if server_path.exists() {
             Some(LanguageServerBinary {
-                path: node.binary_path().await.log_err()?,
+                path: node.binary_path_if_installed().await.log_err()?,
                 env: None,
                 arguments: vec![server_path.into(), "--stdio".into()],
             })
@@ -2075,6 +2087,10 @@ impl BasedPyrightLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for BasedPyrightLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/basedpyright".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }
@@ -2478,6 +2494,10 @@ impl RuffLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for RuffLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/astral-sh/ruff/releases".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }
@@ -2495,6 +2515,8 @@ impl LspAdapter for RuffLspAdapter {
                 LanguageServerBinaryOptions {
                     allow_path_lookup: true,
                     allow_binary_download: false,
+                    allow_binary_update: false,
+                    force_binary_update: false,
                     pre_release: false,
                 },
                 cached_binary,

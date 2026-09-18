@@ -10710,9 +10710,84 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
 /// LanguageSettings items that should be included in the "Languages & Tools" page
 /// not the "Editor" page
 fn non_editor_language_settings_data() -> Box<[SettingsPageItem]> {
-    fn lsp_section() -> [SettingsPageItem; 10] {
+    fn lsp_section() -> [SettingsPageItem; 13] {
         [
             SettingsPageItem::SectionHeader("LSP"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Auto Install",
+                description: "Automatically install missing Zed-managed language servers. When off, install available servers from the language server menu.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("global_lsp_settings.auto_install"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project
+                            .global_lsp_settings
+                            .as_ref()?
+                            .auto_install
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project
+                            .global_lsp_settings
+                            .get_or_insert_default()
+                            .auto_install = value;
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Auto Update",
+                description: "Automatically update Zed-managed language servers. When off, check for updates from the language server menu. Locally installed servers are unaffected.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("global_lsp_settings.auto_update"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project
+                            .global_lsp_settings
+                            .as_ref()?
+                            .auto_update
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project
+                            .global_lsp_settings
+                            .get_or_insert_default()
+                            .auto_update = value;
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Auto Start",
+                description: "Automatically start language servers when opening files. When off, start servers from the language server menu.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("global_lsp_settings.auto_start"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project
+                            .global_lsp_settings
+                            .as_ref()?
+                            .auto_start
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project
+                            .global_lsp_settings
+                            .get_or_insert_default()
+                            .auto_start = value;
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Enable Language Server",
                 description: "Whether to use language servers to provide code intelligence.",

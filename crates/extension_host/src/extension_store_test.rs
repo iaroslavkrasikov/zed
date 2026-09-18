@@ -4117,6 +4117,7 @@ impl Extension for FakeExtension {
         _language_name: LanguageName,
         _worktree: Arc<dyn WorktreeDelegate>,
         _language_server_status_source: EntityId,
+        _binary_options: lsp::LanguageServerBinaryOptions,
     ) -> anyhow::Result<Command> {
         anyhow::bail!("not supported by FakeExtension")
     }

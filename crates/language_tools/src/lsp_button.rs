@@ -295,6 +295,166 @@ impl LanguageServerState {
                 })
                 .unwrap_or_default();
 
+        let management = self
+            .lsp_store
+            .upgrade()
+            .map(|store| store.read(cx).language_server_management.clone())
+            .unwrap_or_default();
+        for available in [false, true] {
+            let entries = management
+                .iter()
+                .filter(|(_, entry)| {
+                    let state = entry.state();
+                    state != proto::language_server_management::State::Running
+                        && (state == proto::language_server_management::State::Available)
+                            == available
+                })
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                continue;
+            }
+            menu = menu.header(if available {
+                "Available to Install"
+            } else {
+                "Language Servers"
+            });
+            for (server_id, entry) in entries {
+                let server_id = *server_id;
+                let state = entry.state();
+                let busy = matches!(
+                    state,
+                    proto::language_server_management::State::Discovering
+                        | proto::language_server_management::State::Starting
+                        | proto::language_server_management::State::Disabled
+                );
+                let (icon, color, label) = match state {
+                    proto::language_server_management::State::Available => {
+                        (IconName::Download, Color::Muted, "Available to install")
+                    }
+                    proto::language_server_management::State::Failed => {
+                        (IconName::Warning, Color::Error, "Retry")
+                    }
+                    proto::language_server_management::State::Discovering => {
+                        (IconName::Circle, Color::Muted, "Discovering…")
+                    }
+                    proto::language_server_management::State::Starting => {
+                        (IconName::Circle, Color::Modified, "Starting…")
+                    }
+                    proto::language_server_management::State::Disabled => {
+                        (IconName::Circle, Color::Disabled, "Disabled by settings")
+                    }
+                    _ => (IconName::PlayOutlined, Color::Disabled, "Click to start"),
+                };
+                let action = if available
+                    || (entry.managed
+                        && entry.binary_path.is_none()
+                        && state == proto::language_server_management::State::Failed)
+                {
+                    proto::LanguageServerManagementAction::InstallServer
+                } else {
+                    proto::LanguageServerManagementAction::StartServer
+                };
+                let name = entry.name.clone();
+                let source = entry.source.clone();
+                let project_name = self
+                    .lsp_store
+                    .upgrade()
+                    .and_then(|store| {
+                        store.read(cx).worktree_store().read(cx).worktree_for_id(
+                            settings::WorktreeId::from_proto(entry.worktree_id),
+                            cx,
+                        )
+                    })
+                    .map(|worktree| worktree.read(cx).root_name_str().to_string())
+                    .unwrap_or_default();
+                let details = if let Some(error) = entry.error.as_ref() {
+                    error.clone()
+                } else if available {
+                    format!(
+                        "Install {} using Zed.\nSource: {}",
+                        entry.name,
+                        source.as_deref().unwrap_or("Zed language support")
+                    )
+                } else {
+                    format!(
+                        "{}\n{}",
+                        entry.name,
+                        entry
+                            .binary_path
+                            .as_deref()
+                            .unwrap_or("Looking for an installed language server")
+                    )
+                };
+                let details = format!("{details}\nProject: {project_name}");
+                let store = self.lsp_store.clone();
+                let store_for_update = store.clone();
+                let manual_update = entry.managed && !entry.auto_update && !available && !busy;
+                menu = menu
+                    .custom_entry(
+                        move |_, _| {
+                            let update_button = IconButton::new(
+                                ("update-server", server_id.0),
+                                IconName::ArrowCircle,
+                            )
+                            .tooltip(Tooltip::text("Check for Updates"))
+                            .on_click({
+                                let store = store_for_update.clone();
+                                move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    store
+                                        .update(cx, |store, cx| {
+                                            store.manage_language_server(
+                                                server_id,
+                                                proto::LanguageServerManagementAction::UpdateServer,
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                }
+                            });
+                            h_flex()
+                                .id(("lsp-management", server_id.0))
+                                .w_full()
+                                .gap_2()
+                                .tooltip(Tooltip::text(details.clone()))
+                                .child(Icon::new(icon).color(color).size(IconSize::Small))
+                                .child(Label::new(name.clone()).color(if available {
+                                    Color::Muted
+                                } else {
+                                    color
+                                }))
+                                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                                .child(div().flex_1())
+                                .when(manual_update, |row| row.child(update_button))
+                                .when_some(source.clone(), |row, source| {
+                                    let source_button = IconButton::new(
+                                        ("server-source", server_id.0),
+                                        IconName::ArrowUpRight,
+                                    )
+                                    .tooltip(Tooltip::text("Source / Releases"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.open_url(&source);
+                                    });
+                                    row.child(source_button)
+                                })
+                                .into_any_element()
+                        },
+                        move |_, cx| {
+                            if !busy {
+                                store
+                                    .update(cx, |store, cx| {
+                                        store.manage_language_server(server_id, action, cx)
+                                    })
+                                    .log_err();
+                            }
+                        },
+                    )
+                    .selectable(!busy);
+            }
+            menu = menu.separator();
+        }
+
         let process_memory_cache = self.process_memory_cache.clone();
 
         let mut first_button_encountered = false;
@@ -341,6 +501,14 @@ impl LanguageServerState {
             let Some(server_info) = item.server_info() else {
                 continue;
             };
+            let management = management.get(&server_info.id);
+            if management.is_some_and(|entry| {
+                entry.state() != proto::language_server_management::State::Running
+            }) {
+                continue;
+            }
+            let manual_update = management.is_some_and(|entry| entry.managed && !entry.auto_update);
+            let source = management.and_then(|entry| entry.source.clone());
             let server_selector = server_info.server_selector();
             let is_remote = self
                 .lsp_store
@@ -400,7 +568,11 @@ impl LanguageServerState {
 
             menu = menu.submenu_with_colored_icon(
                 server_info.name.0.clone(),
-                IconName::Circle,
+                if manual_update {
+                    IconName::ArrowCircle
+                } else {
+                    IconName::Circle
+                },
                 status_color,
                 {
                     let lsp_logs = lsp_logs.clone();
@@ -414,6 +586,26 @@ impl LanguageServerState {
 
                     move |menu, _window, _cx| {
                         let mut submenu = menu;
+                        if manual_update {
+                            let store = lsp_store.clone();
+                            let server_id = submenu_server_info.id;
+                            submenu = submenu.entry("Check for Updates", None, move |_, cx| {
+                                store
+                                    .update(cx, |store, cx| {
+                                        store.manage_language_server(
+                                            server_id,
+                                            proto::LanguageServerManagementAction::UpdateServer,
+                                            cx,
+                                        )
+                                    })
+                                    .log_err();
+                            });
+                        }
+                        if let Some(source) = source.clone() {
+                            submenu = submenu.entry("Source / Releases", None, move |_, cx| {
+                                cx.open_url(&source)
+                            });
+                        }
 
                         if let Some(ref message) = message {
                             let workspace_for_message = workspace.clone();
@@ -959,7 +1151,14 @@ impl LspButton {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.lsp_menu.is_none() {
+        let management_changed = matches!(
+            e,
+            LspStoreEvent::LanguageServerUpdate {
+                message: proto::update_language_server::Variant::Management(_),
+                ..
+            }
+        );
+        if self.lsp_menu.is_none() && !management_changed {
             return;
         };
         let mut updated = false;
@@ -1064,8 +1263,8 @@ impl LspButton {
             _ => {}
         };
 
-        if updated {
-            self.refresh_lsp_menu(false, window, cx);
+        if updated || management_changed {
+            self.refresh_lsp_menu(management_changed, window, cx);
         }
     }
 
@@ -1365,7 +1564,11 @@ impl StatusItemView for LspButton {
 
     fn hide_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         Some(workspace::HideStatusItem::new(|settings| {
-            settings.global_lsp_settings.get_or_insert_default().button = Some(false);
+            settings
+                .project
+                .global_lsp_settings
+                .get_or_insert_default()
+                .button = Some(false);
         }))
     }
 }
@@ -1384,7 +1587,14 @@ impl Render for LspButton {
             .unwrap_or(false);
 
         if !is_restricted
-            && (self.server_state.read(cx).language_servers.is_empty() || self.lsp_menu.is_none())
+            && ((self.server_state.read(cx).language_servers.is_empty()
+                && self
+                    .server_state
+                    .read(cx)
+                    .lsp_store
+                    .upgrade()
+                    .is_none_or(|store| store.read(cx).language_server_management.is_empty()))
+                || self.lsp_menu.is_none())
         {
             return div().hidden();
         }

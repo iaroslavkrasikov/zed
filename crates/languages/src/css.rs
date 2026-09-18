@@ -132,6 +132,10 @@ impl LspInstaller for CssLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for CssLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/vscode-langservers-extracted".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         LanguageServerName("vscode-css-language-server".into())
     }
@@ -189,7 +193,7 @@ async fn get_cached_server_binary(
             "missing executable in directory {server_path:?}"
         );
         Ok(LanguageServerBinary {
-            path: node.binary_path().await?,
+            path: node.binary_path_if_installed().await?,
             env: None,
             arguments: server_binary_arguments(&server_path),
         })

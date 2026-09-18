@@ -171,6 +171,10 @@ fn ensure_arch_compatibility() -> Result<()> {
 
 #[async_trait(?Send)]
 impl super::LspAdapter for CLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/clangd/clangd/releases".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }

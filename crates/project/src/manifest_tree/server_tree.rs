@@ -58,6 +58,7 @@ pub(crate) struct LaunchDisposition {
     pub(crate) path: ProjectPath,
     pub(crate) settings: Arc<LspSettings>,
     pub(crate) toolchain: Option<Toolchain>,
+    pub(crate) lifecycle: crate::project_settings::LanguageServerLifecycleSettings,
 }
 
 impl LanguageServerTreeNode {
@@ -103,6 +104,7 @@ impl InnerTreeNode {
         path: ProjectPath,
         settings: LspSettings,
         toolchain: Option<Toolchain>,
+        lifecycle: crate::project_settings::LanguageServerLifecycleSettings,
     ) -> Self {
         InnerTreeNode {
             id: Default::default(),
@@ -111,6 +113,7 @@ impl InnerTreeNode {
                 path,
                 settings: settings.into(),
                 toolchain,
+                lifecycle,
             }),
         }
     }
@@ -192,6 +195,15 @@ impl LanguageServerTree {
                         root_path.clone(),
                         settings.clone(),
                         toolchain,
+                        crate::project_settings::ProjectSettings::get(
+                            Some(SettingsLocation {
+                                worktree_id: root_path.worktree_id,
+                                path: &root_path.path,
+                            }),
+                            cx,
+                        )
+                        .global_lsp_settings
+                        .lifecycle(),
                     )),
                     Default::default(),
                 )
@@ -424,7 +436,8 @@ impl ServerTreeRebase {
                         // Only compare settings that require server restart.
                         // Dynamic settings (settings.settings) can be updated via DidChangeConfiguration
                         // without restarting the server.
-                        disposition.toolchain == old_node.disposition.toolchain
+                        disposition.lifecycle == old_node.disposition.lifecycle
+                            && disposition.toolchain == old_node.disposition.toolchain
                             && disposition.settings.binary == old_node.disposition.settings.binary
                             && disposition.settings.initialization_options
                                 == old_node.disposition.settings.initialization_options

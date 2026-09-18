@@ -54,7 +54,7 @@ impl BashLspAdapter {
                 "missing executable in directory {server_path:?}"
             );
             Ok(LanguageServerBinary {
-                path: node.binary_path().await?,
+                path: node.binary_path_if_installed().await?,
                 env: Some(env),
                 arguments: vec![server_path.into(), "start".into()],
             })
@@ -170,6 +170,10 @@ impl LspInstaller for BashLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for BashLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/bash-language-server".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         LanguageServerName::new_static(Self::PACKAGE_NAME)
     }

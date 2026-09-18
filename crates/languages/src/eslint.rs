@@ -168,7 +168,7 @@ impl LspInstaller for EsLintLspAdapter {
             Self::build_destination_path(&container_dir).join(EsLintLspAdapter::SERVER_PATH);
         fs::metadata(&server_path).await.ok()?;
         Some(LanguageServerBinary {
-            path: self.node.binary_path().await.ok()?,
+            path: self.node.binary_path_if_installed().await.ok()?,
             env: None,
             arguments: eslint_server_binary_arguments(&server_path),
         })
@@ -213,6 +213,10 @@ impl EslintSettingsOverrides {
 
 #[async_trait(?Send)]
 impl LspAdapter for EsLintLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/microsoft/vscode-eslint/releases".into())
+    }
+
     fn code_action_kinds(&self) -> Option<Vec<CodeActionKind>> {
         Some(vec![
             CodeActionKind::QUICKFIX,

@@ -204,6 +204,10 @@ impl LspInstaller for GoLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for GoLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/golang/tools/releases".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }

@@ -133,6 +133,10 @@ impl LspInstaller for YamlLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for YamlLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/yaml-language-server".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }
@@ -214,7 +218,7 @@ async fn get_cached_server_binary(
             "missing executable in directory {server_path:?}"
         );
         Ok(LanguageServerBinary {
-            path: node.binary_path().await?,
+            path: node.binary_path_if_installed().await?,
             env: None,
             arguments: server_binary_arguments(&server_path),
         })

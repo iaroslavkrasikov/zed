@@ -312,6 +312,9 @@ impl http_client::Host for WasmState {
         &mut self,
         request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<http_client::HttpResponse, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             let url = &request.url;
             let request = convert_request(&request)?;
@@ -330,6 +333,9 @@ impl http_client::Host for WasmState {
         &mut self,
         request: http_client::HttpRequest,
     ) -> wasmtime::Result<Result<Resource<ExtensionHttpResponseStream>, String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         let request = convert_request(&request).into_wasmtime_result()?;
         let response = self.host.http_client.send(request);
         maybe!(async {
@@ -500,6 +506,9 @@ impl ExtensionImports for WasmState {
         server_name: String,
         status: LanguageServerInstallationStatus,
     ) -> wasmtime::Result<()> {
+        if !self.language_server_downloads_allowed {
+            return Ok(());
+        }
         let status = match status {
             LanguageServerInstallationStatus::CheckingForUpdate => BinaryStatus::CheckingForUpdate,
             LanguageServerInstallationStatus::Downloading => BinaryStatus::Downloading,
@@ -522,6 +531,9 @@ impl ExtensionImports for WasmState {
         path: String,
         file_type: DownloadedFileType,
     ) -> wasmtime::Result<Result<(), String>> {
+        if let Err(error) = self.ensure_language_server_download_allowed() {
+            return Ok(Err(error.to_string()));
+        }
         maybe!(async {
             let path = PathBuf::from(path);
             let extension_work_dir = self.host.work_dir.join(self.manifest.id.as_ref());

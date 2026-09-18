@@ -249,6 +249,10 @@ impl LspInstaller for JsonLspAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for JsonLspAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://www.npmjs.com/package/vscode-langservers-extracted".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         LanguageServerName("json-language-server".into())
     }
@@ -394,7 +398,7 @@ async fn get_cached_server_binary(
             "missing executable in directory {server_path:?}"
         );
         Ok(LanguageServerBinary {
-            path: node.binary_path().await?,
+            path: node.binary_path_if_installed().await?,
             env: None,
             arguments: server_binary_arguments(&server_path),
         })
@@ -550,6 +554,10 @@ impl LspInstaller for NodeVersionAdapter {
 
 #[async_trait(?Send)]
 impl LspAdapter for NodeVersionAdapter {
+    fn installation_source(&self) -> Option<String> {
+        Some("https://github.com/zed-industries/package-version-server/releases".into())
+    }
+
     fn name(&self) -> LanguageServerName {
         Self::SERVER_NAME
     }

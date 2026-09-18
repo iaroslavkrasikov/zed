@@ -65,7 +65,7 @@ use futures::{
     AsyncWriteExt, Future, FutureExt, StreamExt,
     channel::oneshot,
     future::{Shared, join_all},
-    select, select_biased,
+    select_biased,
     stream::FuturesUnordered,
 };
 use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
@@ -173,7 +173,6 @@ pub use worktree::{
     UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
 };
 
-const SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SERVER_PROGRESS_THROTTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const WORKSPACE_DIAGNOSTICS_TOKEN_START: &str = "id:";
 const WORKSPACE_DIAGNOSTICS_REPULL_DELAY: Duration = Duration::from_secs(2);
@@ -278,6 +277,7 @@ struct UnifiedLanguageServer {
 struct LanguageServerSeedSettings {
     binary: Option<BinarySettings>,
     initialization_options: Option<serde_json::Value>,
+    lifecycle: crate::project_settings::LanguageServerLifecycleSettings,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -359,6 +359,9 @@ pub struct LocalLspStore {
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     all_language_servers_stopped: bool,
     stopped_language_servers: HashSet<LanguageServerName>,
+    language_server_launches: HashMap<LanguageServerId, (Arc<LaunchDisposition>, LanguageName)>,
+    language_server_actions: HashMap<LanguageServerSeed, proto::LanguageServerManagementAction>,
+    manually_started_language_servers: HashSet<(WorktreeId, LanguageServerName)>,
 
     buffers_to_refresh_hash_set: HashSet<BufferId>,
     buffers_to_refresh_queue: VecDeque<BufferId>,
@@ -391,6 +394,7 @@ impl LocalLspStore {
             worktree_id: worktree_handle.read(cx).id(),
             name: disposition.server_name.clone(),
             settings: LanguageServerSeedSettings {
+                lifecycle: disposition.lifecycle,
                 binary: disposition.settings.binary.clone(),
                 initialization_options: disposition.settings.initialization_options.clone(),
             },
@@ -410,7 +414,7 @@ impl LocalLspStore {
                 worktree_handle,
                 delegate,
                 adapter,
-                disposition.settings.clone(),
+                disposition.clone(),
                 key.clone(),
                 language_name.clone(),
                 cx,
@@ -440,11 +444,22 @@ impl LocalLspStore {
         worktree_handle: &Entity<Worktree>,
         delegate: Arc<LocalLspAdapterDelegate>,
         adapter: Arc<CachedLspAdapter>,
-        settings: Arc<LspSettings>,
+        disposition: Arc<LaunchDisposition>,
         key: LanguageServerSeed,
         language_name: LanguageName,
         cx: &mut App,
     ) -> LanguageServerId {
+        let settings = disposition.settings.clone();
+        let lifecycle = disposition.lifecycle;
+        let action = self.language_server_actions.remove(&key);
+        if action == Some(proto::LanguageServerManagementAction::StartServer) {
+            self.manually_started_language_servers
+                .insert((key.worktree_id, key.name.clone()));
+        }
+        let should_start = lifecycle.auto_start
+            || self
+                .manually_started_language_servers
+                .contains(&(key.worktree_id, key.name.clone()));
         let worktree = worktree_handle.read(cx);
 
         let worktree_id = worktree.id();
@@ -455,6 +470,8 @@ impl LocalLspStore {
         let stderr_capture = Arc::new(Mutex::new(Some(String::new())));
 
         let server_id = self.languages.next_language_server_id();
+        self.language_server_launches
+            .insert(server_id, (disposition.clone(), language_name.clone()));
         log::trace!(
             "attempting to start language server {:?}, path: {worktree_abs_path:?}, id: {server_id}",
             adapter.name.0
@@ -503,10 +520,20 @@ impl LocalLspStore {
         let binary = self.get_language_server_binary(
             worktree_abs_path.clone(),
             adapter.clone(),
-            settings,
+            settings.clone(),
             toolchain.clone(),
             delegate.clone(),
-            true,
+            lifecycle.auto_install
+                || action.is_some_and(|action| {
+                    matches!(
+                        action,
+                        proto::LanguageServerManagementAction::InstallServer
+                            | proto::LanguageServerManagementAction::UpdateServer
+                    )
+                }),
+            lifecycle.auto_update
+                || action == Some(proto::LanguageServerManagementAction::UpdateServer),
+            action == Some(proto::LanguageServerManagementAction::UpdateServer),
             wait_until_worktree_trust,
             cx,
         );
@@ -516,11 +543,52 @@ impl LocalLspStore {
             let adapter = adapter.clone();
             let server_name = adapter.name.clone();
             let stderr_capture = stderr_capture.clone();
-            #[cfg(any(test, feature = "test-support"))]
             let lsp_store = self.weak.clone();
+            let mut management = proto::LanguageServerManagement {
+                name: adapter.name().to_string(),
+                worktree_id: worktree_id.to_proto(),
+                root_path: disposition.path.path.to_string(),
+                managed: settings
+                    .binary
+                    .as_ref()
+                    .and_then(|binary| binary.path.as_ref())
+                    .is_none(),
+                auto_update: lifecycle.auto_update,
+                source: adapter.adapter.installation_source(),
+                state: proto::language_server_management::State::Discovering as i32,
+                binary_path: None,
+                error: None,
+            };
             let pending_workspace_folders = pending_workspace_folders.clone();
             async move |cx| {
-                let binary = binary.await?;
+                lsp_store.update(cx, |store, cx| {
+                    store.publish_language_server_management(server_id, management.clone(), cx)
+                })?;
+                let (binary, managed) = match binary.await {
+                    Ok(binary) => binary,
+                    Err(error) if error.is::<language::LanguageServerNotInstalled>() => {
+                        management.state =
+                            proto::language_server_management::State::Available as i32;
+                        lsp_store.update(cx, |store, cx| {
+                            store.publish_language_server_management(server_id, management, cx)
+                        })?;
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                management.managed = managed;
+                management.binary_path = Some(binary.path.to_string_lossy().into_owned());
+                management.state = if should_start {
+                    proto::language_server_management::State::Starting
+                } else {
+                    proto::language_server_management::State::Idle
+                } as i32;
+                lsp_store.update(cx, |store, cx| {
+                    store.publish_language_server_management(server_id, management, cx)
+                })?;
+                if !should_start {
+                    return Ok(None);
+                }
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(server) = lsp_store
                     .update(&mut cx.clone(), |this, cx| {
@@ -534,7 +602,7 @@ impl LocalLspStore {
                     .ok()
                     .flatten()
                 {
-                    return Ok(server);
+                    return Ok(Some(server));
                 }
 
                 let code_action_kinds = adapter.code_action_kinds();
@@ -548,6 +616,7 @@ impl LocalLspStore {
                     Some(pending_workspace_folders),
                     cx,
                 )
+                .map(Some)
             }
         });
 
@@ -572,7 +641,9 @@ impl LocalLspStore {
                 .use_tree_sitter();
             cx.spawn(async move |cx| {
                 let result = async {
-                    let language_server = pending_server.await?;
+                    let Some(language_server) = pending_server.await? else {
+                        return Ok(None);
+                    };
 
                     let workspace_config = Self::workspace_configuration_for_adapter(
                         adapter.adapter.clone(),
@@ -645,12 +716,12 @@ impl LocalLspStore {
                         did_change_configuration_params,
                     )?;
 
-                    anyhow::Ok(language_server)
+                    anyhow::Ok(Some(language_server))
                 }
                 .await;
 
                 match result {
-                    Ok(server) => {
+                    Ok(Some(server)) => {
                         lsp_store
                             .update(cx, |lsp_store, cx| {
                                 lsp_store.insert_newly_running_language_server(
@@ -668,7 +739,25 @@ impl LocalLspStore {
                         Some(server)
                     }
 
+                    Ok(None) => {
+                        delegate.update_status(adapter.name(), BinaryStatus::None);
+                        None
+                    }
                     Err(err) => {
+                        lsp_store
+                            .update(cx, |store, cx| {
+                                if let Some(mut management) =
+                                    store.language_server_management.get(&server_id).cloned()
+                                {
+                                    management.state =
+                                        proto::language_server_management::State::Failed as i32;
+                                    management.error = Some(format!("{err:#}"));
+                                    store.publish_language_server_management(
+                                        server_id, management, cx,
+                                    );
+                                }
+                            })
+                            .log_err();
                         let log = stderr_capture.lock().take().unwrap_or_default();
                         delegate.update_status(
                             adapter.name(),
@@ -719,9 +808,11 @@ impl LocalLspStore {
         toolchain: Option<Toolchain>,
         delegate: Arc<dyn LspAdapterDelegate>,
         allow_binary_download: bool,
+        allow_binary_update: bool,
+        force_binary_update: bool,
         wait_until_worktree_trust: Option<watch::Receiver<bool>>,
         cx: &mut App,
-    ) -> Task<Result<LanguageServerBinary>> {
+    ) -> Task<Result<(LanguageServerBinary, bool)>> {
         if let Some(settings) = &settings.binary
             && let Some(path) = settings.path.as_ref().map(PathBuf::from)
         {
@@ -749,7 +840,7 @@ impl LocalLspStore {
                 let mut env = delegate.shell_env().await;
                 env.extend(settings.env.unwrap_or_default());
 
-                Ok(LanguageServerBinary {
+                Ok((LanguageServerBinary {
                     path: delegate.resolve_relative_path(path),
                     env: Some(env),
                     arguments: settings
@@ -758,7 +849,7 @@ impl LocalLspStore {
                         .iter()
                         .map(Into::into)
                         .collect(),
-                })
+                }, false))
             });
         }
 
@@ -787,11 +878,11 @@ impl LocalLspStore {
                     );
                 }
 
-                Ok(LanguageServerBinary {
+                Ok((LanguageServerBinary {
                     path: PathBuf::from(format!("/fake/lsp/{language_server_name}")),
                     arguments: Vec::new(),
                     env: None,
-                })
+                }, false))
             });
         }
 
@@ -809,6 +900,8 @@ impl LocalLspStore {
                 .and_then(|b| b.ignore_system_version)
                 .unwrap_or_default(),
             allow_binary_download,
+            allow_binary_update,
+            force_binary_update,
             pre_release: settings
                 .fetch
                 .as_ref()
@@ -837,7 +930,7 @@ impl LocalLspStore {
                 }
             }
 
-            let (existing_binary, maybe_download_binary) = adapter
+            let (existing_binary, maybe_download_binary, managed) = adapter
                 .clone()
                 .get_language_server_command(delegate.clone(), toolchain, lsp_binary_options, cx)
                 .await
@@ -848,6 +941,7 @@ impl LocalLspStore {
             let mut binary = match (existing_binary, maybe_download_binary) {
                 (binary, None) => binary?,
                 (Err(_), Some(downloader)) => downloader.await?,
+                (Ok(_), Some(downloader)) if force_binary_update => downloader.await?,
                 (Ok(existing_binary), Some(downloader)) => {
                     let mut download_timeout = cx
                         .background_executor()
@@ -881,7 +975,7 @@ impl LocalLspStore {
             }
 
             binary.env = Some(shell_env);
-            Ok(binary)
+            Ok((binary, managed))
         })
     }
 
@@ -4514,6 +4608,7 @@ pub struct LspStore {
     worktree_store: Entity<WorktreeStore>,
     pub languages: Arc<LanguageRegistry>,
     pub language_server_statuses: BTreeMap<LanguageServerId, LanguageServerStatus>,
+    pub language_server_management: BTreeMap<LanguageServerId, proto::LanguageServerManagement>,
     active_entry: Option<ProjectEntryId>,
     _maintain_workspace_config: (Task<Result<()>>, watch::Sender<()>),
     _maintain_buffer_languages: Task<()>,
@@ -4913,6 +5008,9 @@ impl LspStore {
                 restricted_worktrees_tasks: HashMap::default(),
                 all_language_servers_stopped: false,
                 stopped_language_servers: HashSet::default(),
+                language_server_launches: HashMap::default(),
+                language_server_actions: HashMap::default(),
+                manually_started_language_servers: HashSet::default(),
                 watched_manifest_filenames: ManifestProvidersStore::global(cx)
                     .manifest_file_names(),
             }),
@@ -4922,6 +5020,7 @@ impl LspStore {
             worktree_store,
             languages: languages.clone(),
             language_server_statuses: Default::default(),
+            language_server_management: Default::default(),
             nonce: StdRng::from_os_rng().random(),
             diagnostic_summaries: HashMap::default(),
             lsp_server_capabilities: HashMap::default(),
@@ -4985,6 +5084,7 @@ impl LspStore {
             worktree_store,
             languages: languages.clone(),
             language_server_statuses: Default::default(),
+            language_server_management: Default::default(),
             nonce: StdRng::from_os_rng().random(),
             diagnostic_summaries: HashMap::default(),
             lsp_server_capabilities: HashMap::default(),
@@ -6418,6 +6518,7 @@ impl LspStore {
                                 worktree_id,
                                 name: disposition.server_name.clone(),
                                 settings: LanguageServerSeedSettings {
+                                    lifecycle: disposition.lifecycle,
                                     binary: disposition.settings.binary.clone(),
                                     initialization_options: disposition
                                         .settings
@@ -6474,6 +6575,13 @@ impl LspStore {
         }
         local.lsp_tree = new_tree;
         for (id, _) in to_stop {
+            if let Some(mut management) = self.language_server_management.get(&id).cloned() {
+                management.state = proto::language_server_management::State::Disabled as i32;
+                self.publish_language_server_management(id, management, cx);
+            }
+            if let Some(local) = self.as_local_mut() {
+                local.language_server_launches.remove(&id);
+            }
             self.stop_local_language_server(id, cx).detach();
         }
     }
@@ -9855,6 +9963,16 @@ impl LspStore {
     }
 
     fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
+        self.language_server_management
+            .retain(|_, management| management.worktree_id != id_to_remove.to_proto());
+        if let Some(local) = self.as_local_mut() {
+            local
+                .language_server_launches
+                .retain(|_, (disposition, _)| disposition.path.worktree_id != id_to_remove);
+            local
+                .manually_started_language_servers
+                .retain(|(worktree_id, _)| *worktree_id != id_to_remove);
+        }
         self.diagnostic_summaries.remove(&id_to_remove);
         if let Some(local) = self.as_local_mut() {
             let to_remove = local.remove_worktree(id_to_remove, cx);
@@ -9940,6 +10058,18 @@ impl LspStore {
         _: &mut Context<Self>,
     ) {
         self.downstream_client = Some((downstream_client.clone(), project_id));
+        for (server_id, management) in &self.language_server_management {
+            downstream_client
+                .send(proto::UpdateLanguageServer {
+                    project_id,
+                    language_server_id: server_id.to_proto(),
+                    server_name: Some(management.name.clone()),
+                    variant: Some(proto::update_language_server::Variant::Management(
+                        management.clone(),
+                    )),
+                })
+                .log_err();
+        }
 
         for (server_id, status) in &self.language_server_statuses {
             if let Some(server) = self.language_server_for_id(*server_id)
@@ -11463,6 +11593,14 @@ impl LspStore {
                     lsp_store.disk_based_diagnostics_finished(language_server_id, cx)
                 }
 
+                proto::update_language_server::Variant::Management(management) => {
+                    lsp_store.publish_language_server_management(
+                        language_server_id,
+                        management,
+                        cx,
+                    );
+                }
+
                 proto::update_language_server::Variant::Removed(_) => {
                     lsp_store
                         .language_server_statuses
@@ -12358,6 +12496,24 @@ impl LspStore {
         mut cx: AsyncApp,
     ) -> Result<proto::Ack> {
         this.update(&mut cx, |lsp_store, cx| {
+            if let Some(action) = envelope
+                .payload
+                .management_action
+                .and_then(|action| proto::LanguageServerManagementAction::try_from(action).ok())
+            {
+                for selector in envelope.payload.only_servers {
+                    if let Some(proto::language_server_selector::Selector::ServerId(server_id)) =
+                        selector.selector
+                    {
+                        lsp_store.manage_language_server(
+                            LanguageServerId::from_proto(server_id),
+                            action,
+                            cx,
+                        );
+                    }
+                }
+                return;
+            }
             let buffers =
                 lsp_store.buffer_ids_to_buffers(envelope.payload.buffer_ids.into_iter(), cx);
             lsp_store.restart_language_servers_for_buffers(
@@ -12776,24 +12932,11 @@ impl LspStore {
 
     async fn shutdown_language_server(
         server_state: Option<LanguageServerState>,
-        name: LanguageServerName,
-        cx: &mut AsyncApp,
+        _name: LanguageServerName,
+        _cx: &mut AsyncApp,
     ) {
         let server = match server_state {
-            Some(LanguageServerState::Starting { startup, .. }) => {
-                let mut timer = cx
-                    .background_executor()
-                    .timer(SERVER_LAUNCHING_BEFORE_SHUTDOWN_TIMEOUT)
-                    .fuse();
-
-                select! {
-                    server = startup.fuse() => server,
-                    () = timer => {
-                        log::info!("timeout waiting for language server {name} to finish launching before stopping");
-                        None
-                    },
-                }
-            }
+            Some(LanguageServerState::Starting { .. }) => None,
 
             Some(LanguageServerState::Running { server, .. }) => Some(server),
 
@@ -12890,6 +13033,16 @@ impl LspStore {
         local.initial_server_capabilities.remove(&server_id);
 
         let server_state = local.language_servers.remove(&server_id);
+        if let Some(mut management) = self.language_server_management.get(&server_id).cloned() {
+            if !matches!(
+                management.state(),
+                proto::language_server_management::State::Available
+                    | proto::language_server_management::State::Disabled
+            ) {
+                management.state = proto::language_server_management::State::Idle as i32;
+            }
+            self.publish_language_server_management(server_id, management, cx);
+        }
         self.cleanup_lsp_data(server_id);
         let name = self
             .language_server_statuses
@@ -12930,9 +13083,170 @@ impl LspStore {
         Task::ready(())
     }
 
+    fn publish_language_server_management(
+        &mut self,
+        server_id: LanguageServerId,
+        management: proto::LanguageServerManagement,
+        cx: &mut Context<Self>,
+    ) {
+        let retired_ids = self
+            .language_server_management
+            .iter()
+            .filter_map(|(id, previous)| {
+                (*id != server_id
+                    && previous.name == management.name
+                    && previous.worktree_id == management.worktree_id
+                    && previous.root_path == management.root_path)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for retired_id in retired_ids {
+            self.language_server_management.remove(&retired_id);
+            if let Some(local) = self.as_local_mut() {
+                local.language_server_launches.remove(&retired_id);
+            }
+        }
+        self.language_server_management
+            .insert(server_id, management.clone());
+        cx.emit(LspStoreEvent::LanguageServerUpdate {
+            language_server_id: server_id,
+            name: Some(LanguageServerName::from_proto(management.name.clone())),
+            message: proto::update_language_server::Variant::Management(management),
+        });
+        cx.notify();
+    }
+
+    pub fn manage_language_server(
+        &mut self,
+        server_id: LanguageServerId,
+        action: proto::LanguageServerManagementAction,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((client, project_id)) = self.upstream_client() {
+            let request = client.request(proto::RestartLanguageServers {
+                project_id,
+                buffer_ids: Vec::new(),
+                only_servers: vec![proto::LanguageServerSelector {
+                    selector: Some(proto::language_server_selector::Selector::ServerId(
+                        server_id.to_proto(),
+                    )),
+                }],
+                all: false,
+                management_action: Some(action as i32),
+            });
+            cx.background_spawn(request).detach_and_log_err(cx);
+            return;
+        }
+        if self
+            .language_server_management
+            .get(&server_id)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.state(),
+                    proto::language_server_management::State::Discovering
+                        | proto::language_server_management::State::Starting
+                )
+            })
+        {
+            return;
+        }
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
+        let Some((disposition, language_name)) =
+            local.language_server_launches.get(&server_id).cloned()
+        else {
+            return;
+        };
+        let Some(worktree) = local
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(disposition.path.worktree_id, cx)
+        else {
+            return;
+        };
+        local
+            .lsp_tree
+            .remove_nodes(&BTreeSet::from_iter([server_id]));
+        let stop = self.stop_local_language_server(server_id, cx);
+        if let Some(mut management) = self.language_server_management.get(&server_id).cloned() {
+            management.state = proto::language_server_management::State::Discovering as i32;
+            self.publish_language_server_management(server_id, management, cx);
+        }
+        cx.spawn(async move |store, cx| {
+            stop.await;
+            store.update(cx, |store, cx| {
+                store.language_server_management.remove(&server_id);
+                let buffers = store.buffer_store.read(cx).buffers().collect::<Vec<_>>();
+                let Some(local) = store.as_local_mut() else {
+                    return;
+                };
+                local.language_server_launches.remove(&server_id);
+                local.all_language_servers_stopped = false;
+                local
+                    .stopped_language_servers
+                    .remove(&disposition.server_name);
+                let mut disposition = (*disposition).clone();
+                disposition.lifecycle = ProjectSettings::get(
+                    Some(SettingsLocation {
+                        worktree_id: disposition.path.worktree_id,
+                        path: &disposition.path.path,
+                    }),
+                    cx,
+                )
+                .global_lsp_settings
+                .lifecycle();
+                let key = LanguageServerSeed {
+                    worktree_id: disposition.path.worktree_id,
+                    name: disposition.server_name.clone(),
+                    settings: LanguageServerSeedSettings {
+                        binary: disposition.settings.binary.clone(),
+                        initialization_options: disposition.settings.initialization_options.clone(),
+                        lifecycle: disposition.lifecycle,
+                    },
+                    toolchain: disposition.toolchain.clone(),
+                };
+                local.language_server_actions.insert(key, action);
+                let delegate = LocalLspAdapterDelegate::from_local_lsp(local, &worktree, cx);
+                local.get_or_insert_language_server(
+                    &worktree,
+                    delegate,
+                    &Arc::new(disposition),
+                    &language_name,
+                    cx,
+                );
+                for buffer in buffers {
+                    let value = buffer.read(cx);
+                    if File::from_dyn(value.file())
+                        .is_some_and(|file| file.worktree_id(cx) == worktree.read(cx).id())
+                        && value
+                            .language()
+                            .is_some_and(|language| language.name() == language_name)
+                        && local.registered_buffers.contains_key(&value.remote_id())
+                    {
+                        local.register_buffer_with_language_servers(
+                            &buffer,
+                            HashSet::default(),
+                            cx,
+                        );
+                    }
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     pub fn stop_all_language_servers(&mut self, cx: &mut Context<Self>) {
         if let Some(local) = self.as_local_mut() {
             local.all_language_servers_stopped = true;
+            local.stopped_language_servers.extend(
+                local
+                    .language_server_launches
+                    .values()
+                    .map(|(disposition, _)| disposition.server_name.clone()),
+            );
+            local.manually_started_language_servers.clear();
         }
         self.shutdown_all_language_servers(cx).detach();
     }
@@ -13013,9 +13327,38 @@ impl LspStore {
                     })
                     .collect(),
                 all: false,
+                management_action: None,
             });
             cx.background_spawn(request).detach_and_log_err(cx);
         } else {
+            if clear_stopped {
+                if let Some(local) = self.as_local_mut() {
+                    for (server_id, (disposition, language_name)) in &local.language_server_launches
+                    {
+                        let selected = if only_restart_servers.is_empty() {
+                            buffers.iter().any(|buffer| {
+                                let buffer = buffer.read(cx);
+                                File::from_dyn(buffer.file()).is_some_and(|file| {
+                                    file.worktree_id(cx) == disposition.path.worktree_id
+                                }) && buffer
+                                    .language()
+                                    .is_some_and(|language| language.name() == *language_name)
+                            })
+                        } else {
+                            only_restart_servers.contains(&LanguageServerSelector::Id(*server_id))
+                                || only_restart_servers.contains(&LanguageServerSelector::Name(
+                                    disposition.server_name.clone(),
+                                ))
+                        };
+                        if selected {
+                            local.manually_started_language_servers.insert((
+                                disposition.path.worktree_id,
+                                disposition.server_name.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
             let (stopped_names, stop_task) = if only_restart_servers.is_empty() {
                 self.stop_local_language_servers_for_buffers(&buffers, HashSet::default(), cx)
             } else {
@@ -13100,6 +13443,9 @@ impl LspStore {
             let (stopped_names, task) =
                 self.stop_local_language_servers_for_buffers(&buffers, also_stop_servers, cx);
             if let Some(local) = self.as_local_mut() {
+                local
+                    .manually_started_language_servers
+                    .retain(|(_, name)| !stopped_names.contains(name));
                 local.stopped_language_servers.extend(stopped_names);
             }
             cx.background_spawn(async move {
@@ -13461,6 +13807,13 @@ impl LspStore {
             },
         );
         local.update_binary_status(adapter.name(), BinaryStatus::None);
+        if let Some(mut management) = self.language_server_management.get(&server_id).cloned() {
+            management.state = proto::language_server_management::State::Running as i32;
+            self.publish_language_server_management(server_id, management, cx);
+        }
+        let Some(local) = self.as_local_mut() else {
+            return;
+        };
         if let Some(file_ops_caps) = language_server
             .capabilities()
             .workspace

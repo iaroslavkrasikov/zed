@@ -66,6 +66,7 @@ use project::{
     *,
 };
 use rand::{Rng as _, rngs::StdRng};
+use rpc::proto;
 use serde_json::json;
 use settings::{GlobalLspSettingsContent, SettingsStore, SplicingVec};
 #[cfg(target_os = "linux")]
@@ -3593,7 +3594,7 @@ async fn test_max_buffer_line_length_can_be_overridden(cx: &mut gpui::TestAppCon
     cx.update(|cx| {
         SettingsStore::update_global(cx, |settings, cx| {
             settings.update_user_settings(cx, |settings| {
-                settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                     max_buffer_line_length: Some(20_001),
                     ..Default::default()
                 });
@@ -3611,6 +3612,180 @@ async fn test_max_buffer_line_length_can_be_overridden(cx: &mut gpui::TestAppCon
             .as_str(),
         uri!("file:///dir/minified.js")
     );
+}
+
+#[gpui::test]
+async fn test_lsp_manual_start(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .project
+                    .global_lsp_settings
+                    .get_or_insert_default()
+                    .auto_start = Some(false);
+            });
+        })
+    });
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "", "b.rs": "", "c.rs": "" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut servers = registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    registry.add(rust_lang());
+    let first_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .expect("open buffer");
+    cx.executor().run_until_parked();
+    assert!(servers.next().now_or_never().is_none());
+    let store = project.read_with(cx, |project, _| project.lsp_store());
+    let server_id = store.read_with(cx, |store, _| {
+        let (server_id, management) = store
+            .language_server_management
+            .iter()
+            .next()
+            .expect("discovered server");
+        assert_eq!(
+            management.state(),
+            proto::language_server_management::State::Idle
+        );
+        assert!(!management.managed);
+        *server_id
+    });
+    store.update(cx, |store, cx| {
+        store.manage_language_server(
+            server_id,
+            proto::LanguageServerManagementAction::StartServer,
+            cx,
+        )
+    });
+    let mut server = servers.next().await.expect("started server");
+    assert_eq!(
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/a.rs")
+    );
+    let second_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/b.rs"), cx)
+        })
+        .await
+        .expect("open buffer");
+    assert_eq!(
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri
+            .as_str(),
+        uri!("file:///dir/b.rs")
+    );
+    assert!(servers.next().now_or_never().is_none());
+    store.update(cx, |store, cx| store.stop_all_language_servers(cx));
+    server
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+    let third_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/c.rs"), cx)
+        })
+        .await
+        .expect("open buffer");
+    cx.executor().run_until_parked();
+    assert!(servers.next().now_or_never().is_none());
+    let server_id = store.read_with(cx, |store, _| {
+        *store
+            .language_server_management
+            .keys()
+            .next()
+            .expect("stopped server")
+    });
+    store.update(cx, |store, cx| {
+        store.manage_language_server(
+            server_id,
+            proto::LanguageServerManagementAction::StartServer,
+            cx,
+        )
+    });
+    let mut server = servers.next().await.expect("restarted server");
+    for _ in 0..3 {
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await;
+    }
+    store.update(cx, |store, cx| store.stop_all_language_servers(cx));
+    server
+        .receive_notification::<lsp::notification::Exit>()
+        .await;
+    store.update(cx, |store, cx| store.restart_all_language_servers(cx));
+    let mut server = servers.next().await.expect("explicitly restarted server");
+    for _ in 0..3 {
+        server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await;
+    }
+    drop((first_buffer, second_buffer, third_buffer));
+}
+
+#[gpui::test]
+async fn test_lsp_auto_start_project_override(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/dir"),
+        json!({
+            "a.rs": "",
+            ".zed": { "settings.json": "{\"global_lsp_settings\":{\"auto_start\":false}}" }
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut servers = registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-lsp",
+            ..Default::default()
+        },
+    );
+    registry.add(rust_lang());
+    cx.run_until_parked();
+    let _buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .expect("open buffer");
+    cx.executor().run_until_parked();
+    assert!(servers.next().now_or_never().is_none());
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .project
+                    .global_lsp_settings
+                    .get_or_insert_default()
+                    .auto_start = Some(true);
+            });
+        })
+    });
+    cx.executor().run_until_parked();
+    assert!(servers.next().now_or_never().is_none());
 }
 
 #[gpui::test]

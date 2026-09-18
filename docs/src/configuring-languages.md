@@ -279,6 +279,28 @@ Language servers are automatically downloaded or launched if found in your path,
   }
 ```
 
+### Controlling Installation, Updates, and Startup
+
+The **LSP** section in Settings has three toggles, all enabled by default:
+
+- **Auto Install** installs missing Zed-managed language servers. Turn it off to see installation suggestions in the lightning menu in the status bar. Hover a suggestion to see its source, then click to install.
+- **Auto Update** updates Zed-managed servers automatically. Turn it off to use the update icon and **Check for Updates** action in the menu. Source or release links are available when supplied by the language integration.
+- **Auto Start** starts servers when opening files. Turn it off to leave installed servers idle until you click them in the menu. Starting a server enables it for the current session; stopping it keeps it stopped until another explicit start.
+
+Use user settings or a project’s `.zed/settings.json` to override these defaults:
+
+```json [settings]
+{
+  "global_lsp_settings": {
+    "auto_install": false,
+    "auto_update": false,
+    "auto_start": false
+  }
+}
+```
+
+The toggles are independent. Installing a server leaves it idle when Auto Start is off. Zed prefers locally discovered binaries and does not install updates over them. An explicit `lsp.<server>.binary.path` also bypasses managed installation and updates. Language extensions control how their servers are resolved; Zed restricts their installation operations when automatic installation or updates are disabled and reuses previously resolved managed commands when available.
+
 ### Enabling or Disabling Language Servers
 
 You can toggle language server support globally or per-language:

@@ -16,12 +16,15 @@ pub use slash_command::*;
 pub type EnvVars = Vec<(String, String)>;
 
 /// A command.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Command {
     /// The command to execute.
     pub command: PathBuf,
     /// The arguments to pass to the command.
     pub args: Vec<String>,
     /// The environment variables to set for the command.
+    // Commands cached on disk must not retain credentials from the shell environment.
+    #[serde(skip)]
     pub env: EnvVars,
 }
 

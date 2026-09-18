@@ -2104,6 +2104,9 @@ While other options may be changed at a runtime and should be placed under `sett
 ```json [settings]
 {
   "global_lsp_settings": {
+    "auto_install": true,
+    "auto_update": true,
+    "auto_start": true,
     "button": true,
     "request_timeout": 120,
     "max_buffer_line_length": 20000,
@@ -2118,11 +2121,16 @@ While other options may be changed at a runtime and should be placed under `sett
 
 **Options**
 
+- `auto_install`: Automatically install missing Zed-managed language servers. When disabled, the language server status menu shows **Available to Install** suggestions with their sources. Locally installed servers are already considered installed. Default: `true`.
+- `auto_update`: Automatically update Zed-managed language servers. When disabled, use **Check for Updates** in the language server menu; source/release links are available where provided by the language integration. Locally installed binaries are never updated by Zed. Default: `true`.
+- `auto_start`: Automatically start language servers when opening files. When disabled, installed servers appear idle in the language server menu; click one to start it for the current session. Installing a server does not start it while this setting is disabled. Default: `true`.
 - `button`: Whether to show the LSP status button in the status bar
 - `request_timeout`: The maximum amount of time to wait for responses from language servers, in seconds. A value of `0` will result in no timeout being applied (causing all LSP responses to wait indefinitely until completed). Default: `120`
 - `max_buffer_line_length`: The maximum line length a buffer may contain before Zed disables all language server features for that entire buffer. If any line exceeds this value, Zed does not open the buffer with language servers or send them buffer-specific requests. Default: `20000`
 - `notifications`: Notification-related settings.
   - `dismiss_timeout_ms`: Timeout in milliseconds for automatically dismissing language server notifications. Set to 0 to disable auto-dismiss.
+
+These settings can be overridden in a project’s `.zed/settings.json`. Installation, updates, and startup are independent: turning off Auto Start does not turn off automatic installation or updates. To require an explicit action for all three, set all three toggles to `false`.
 
 ## LSP Highlight Debounce
 

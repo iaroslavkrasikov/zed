@@ -1154,7 +1154,7 @@ mod tests {
         cx.update(|cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                    settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                         semantic_token_rules: Some(SemanticTokenRules {
                             rules: Vec::from([
                                 SemanticTokenRule {
@@ -2051,7 +2051,7 @@ mod tests {
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                    settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                         semantic_token_rules: Some(SemanticTokenRules {
                             rules: Vec::from([SemanticTokenRule {
                                 token_type: Some("function".to_string()),
@@ -2580,7 +2580,7 @@ mod tests {
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                    settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                         semantic_token_rules: Some(SemanticTokenRules {
                             rules: vec![SemanticTokenRule {
                                 token_type: Some("function".to_string()),
@@ -2661,7 +2661,7 @@ mod tests {
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                    settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                         semantic_token_rules: Some(SemanticTokenRules {
                             rules: vec![SemanticTokenRule {
                                 token_type: Some("comment".to_string()),
@@ -2750,7 +2750,7 @@ mod tests {
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.global_lsp_settings = Some(GlobalLspSettingsContent {
+                    settings.project.global_lsp_settings = Some(GlobalLspSettingsContent {
                         semantic_token_rules: Some(SemanticTokenRules {
                             rules: vec![SemanticTokenRule {
                                 token_type: Some("comment".to_string()),

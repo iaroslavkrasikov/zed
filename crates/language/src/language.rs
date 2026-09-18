@@ -328,8 +328,20 @@ pub type LanguageServerBinaryLocations = LocalBoxFuture<
     (
         Result<LanguageServerBinary>,
         Option<DownloadableLanguageServerBinary>,
+        bool,
     ),
 >;
+#[derive(Debug)]
+pub struct LanguageServerNotInstalled;
+
+impl std::fmt::Display for LanguageServerNotInstalled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Language server is available to install")
+    }
+}
+
+impl std::error::Error for LanguageServerNotInstalled {}
+
 /// Represents a Language Server, with certain cached sync properties.
 /// Uses [`LspAdapter`] under the hood, but calls all 'static' methods
 /// once at startup, and caches the results.
@@ -512,6 +524,10 @@ pub trait LspAdapterDelegate: Send + Sync {
 #[async_trait(?Send)]
 pub trait LspAdapter: 'static + Send + Sync + DynLspInstaller {
     fn name(&self) -> LanguageServerName;
+
+    fn installation_source(&self) -> Option<String> {
+        None
+    }
 
     fn process_diagnostics(&self, _: &mut lsp::PublishDiagnosticsParams, _: LanguageServerId) {}
 
@@ -831,20 +847,14 @@ where
                     binary.path,
                     binary.arguments
                 );
-                return (Ok(binary), None);
+                return (Ok(binary), None, false);
             }
 
             if let Some((pre_release, cached_binary)) = cached_binary_deref
                 && *pre_release == binary_options.pre_release
+                && !binary_options.force_binary_update
             {
-                return (Ok(cached_binary.clone()), None);
-            }
-
-            if !binary_options.allow_binary_download {
-                return (
-                    Err(anyhow::anyhow!("downloading language servers disabled")),
-                    None,
-                );
+                return (Ok(cached_binary.clone()), None, true);
             }
 
             let Some(container_dir) = delegate.language_server_download_dir(&self.name()).await
@@ -852,6 +862,7 @@ where
                 return (
                     Err(anyhow::anyhow!("no language server download dir defined")),
                     None,
+                    true,
                 );
             };
 
@@ -861,6 +872,12 @@ where
                 .context(
                     "did not find existing language server binary, falling back to downloading",
                 );
+            if last_downloaded_binary.is_ok() && !binary_options.allow_binary_update {
+                return (last_downloaded_binary, None, true);
+            }
+            if last_downloaded_binary.is_err() && !binary_options.allow_binary_download {
+                return (Err(LanguageServerNotInstalled.into()), None, true);
+            }
             let download_binary = async move {
                 let mut binary = self
                     .try_fetch_server_binary(
@@ -872,6 +889,9 @@ where
                     .await;
 
                 if let Err(error) = binary.as_ref() {
+                    if binary_options.force_binary_update {
+                        return binary;
+                    }
                     if let Some(prev_downloaded_binary) = self
                         .cached_server_binary(container_dir.to_path_buf(), delegate.as_ref())
                         .await
@@ -901,7 +921,7 @@ where
                 binary
             }
             .boxed_local();
-            (last_downloaded_binary, Some(download_binary))
+            (last_downloaded_binary, Some(download_binary), true)
         }
         .boxed_local()
     }
@@ -1727,8 +1747,201 @@ fn test_language(name: &str, grammar: tree_sitter::Language) -> Arc<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{TestAppContext, rgba};
+    use gpui::{AppContext as _, TestAppContext, rgba};
     use pretty_assertions::assert_matches;
+
+    struct InstallerProbe {
+        local: bool,
+        cached: bool,
+        downloads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl InstallerProbe {
+        fn binary(path: &str) -> LanguageServerBinary {
+            LanguageServerBinary {
+                path: path.into(),
+                arguments: Vec::new(),
+                env: None,
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LspAdapter for InstallerProbe {
+        fn name(&self) -> LanguageServerName {
+            LanguageServerName::new_static("installer-probe")
+        }
+    }
+
+    impl LspInstaller for InstallerProbe {
+        type BinaryVersion = ();
+        async fn check_if_user_installed(
+            &self,
+            _: &Arc<dyn LspAdapterDelegate>,
+            _: Option<Toolchain>,
+            _: &AsyncApp,
+        ) -> Option<LanguageServerBinary> {
+            self.local.then(|| Self::binary("/local/server"))
+        }
+        async fn cached_server_binary(
+            &self,
+            _: PathBuf,
+            _: &dyn LspAdapterDelegate,
+        ) -> Option<LanguageServerBinary> {
+            self.cached.then(|| Self::binary("/managed/old-server"))
+        }
+        async fn fetch_latest_server_version(
+            &self,
+            _: &Arc<dyn LspAdapterDelegate>,
+            _: bool,
+            _: &mut AsyncApp,
+        ) -> Result<()> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn fetch_server_binary(
+            &self,
+            _: (),
+            _: PathBuf,
+            _: &Arc<dyn LspAdapterDelegate>,
+        ) -> impl Send + Future<Output = Result<LanguageServerBinary>> + use<> {
+            async { Ok(Self::binary("/managed/new-server")) }
+        }
+    }
+
+    struct InstallerProbeDelegate(EntityId);
+
+    #[async_trait]
+    impl LspAdapterDelegate for InstallerProbeDelegate {
+        fn show_notification(&self, _: &str, _: &mut App) {}
+        fn http_client(&self) -> Arc<dyn HttpClient> {
+            Arc::new(http_client::BlockedHttpClient)
+        }
+        fn worktree_id(&self) -> WorktreeId {
+            WorktreeId::from_proto(1)
+        }
+        fn worktree_root_path(&self) -> &Path {
+            Path::new("/project")
+        }
+        fn resolve_relative_path(&self, path: PathBuf) -> PathBuf {
+            self.worktree_root_path().join(path)
+        }
+        fn status_source_id(&self) -> EntityId {
+            self.0
+        }
+        fn update_status(&self, _: LanguageServerName, _: BinaryStatus) {}
+        fn registered_lsp_adapters(&self) -> Vec<Arc<dyn LspAdapter>> {
+            Vec::new()
+        }
+        async fn language_server_download_dir(&self, _: &LanguageServerName) -> Option<Arc<Path>> {
+            Some(Arc::from(Path::new("/managed")))
+        }
+        async fn npm_package_installed_version(
+            &self,
+            _: &str,
+        ) -> Result<Option<(PathBuf, Version)>> {
+            Ok(None)
+        }
+        async fn which(&self, _: &OsStr) -> Option<PathBuf> {
+            None
+        }
+        async fn shell_env(&self) -> HashMap<String, String> {
+            HashMap::default()
+        }
+        async fn read_text_file(&self, _: &RelPath) -> Result<String> {
+            anyhow::bail!("no files in installer probe")
+        }
+        async fn try_exec(&self, _: LanguageServerBinary) -> Result<()> {
+            anyhow::bail!("installer probe must not execute commands")
+        }
+    }
+
+    #[gpui::test]
+    async fn test_language_server_install_update_policies(cx: &mut TestAppContext) {
+        let entity = cx.new(|_| ());
+        let source = entity.entity_id();
+        cx.spawn(async move |mut cx| {
+            for local in [false, true] {
+                for cached in [false, true] {
+                    for auto_install in [false, true] {
+                        for auto_update in [false, true] {
+                            let downloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                            let adapter = CachedLspAdapter::new(Arc::new(InstallerProbe {
+                                local,
+                                cached,
+                                downloads: downloads.clone(),
+                            }));
+                            let (binary, downloader, managed) = adapter
+                                .clone()
+                                .get_language_server_command(
+                                    Arc::new(InstallerProbeDelegate(source)),
+                                    None,
+                                    LanguageServerBinaryOptions {
+                                        allow_path_lookup: true,
+                                        allow_binary_download: auto_install,
+                                        allow_binary_update: auto_update,
+                                        force_binary_update: false,
+                                        pre_release: false,
+                                    },
+                                    &mut cx,
+                                )
+                                .await
+                                .await;
+                            assert_eq!(managed, !local);
+                            assert_eq!(binary.is_ok(), local || cached);
+                            let should_download =
+                                !local && if cached { auto_update } else { auto_install };
+                            assert_eq!(downloader.is_some(), should_download);
+                            if let Some(downloader) = downloader {
+                                assert_eq!(
+                                    downloader.await?.path,
+                                    Path::new("/managed/new-server")
+                                );
+                            } else if !local && !cached {
+                                assert!(
+                                    binary.err().is_some_and(|error| error
+                                        .is::<LanguageServerNotInstalled>(
+                                    ))
+                                );
+                            }
+                            assert_eq!(
+                                downloads.load(std::sync::atomic::Ordering::SeqCst),
+                                usize::from(should_download)
+                            );
+                            let (_, downloader, managed) = adapter
+                                .get_language_server_command(
+                                    Arc::new(InstallerProbeDelegate(source)),
+                                    None,
+                                    LanguageServerBinaryOptions {
+                                        allow_path_lookup: true,
+                                        allow_binary_download: true,
+                                        allow_binary_update: true,
+                                        force_binary_update: true,
+                                        pre_release: false,
+                                    },
+                                    &mut cx,
+                                )
+                                .await
+                                .await;
+                            assert_eq!(managed, !local);
+                            assert_eq!(downloader.is_some(), !local);
+                            if let Some(downloader) = downloader {
+                                downloader.await?;
+                            }
+                            assert_eq!(
+                                downloads.load(std::sync::atomic::Ordering::SeqCst),
+                                usize::from(should_download) + usize::from(!local)
+                            );
+                        }
+                    }
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .expect("installer policies");
+    }
 
     #[test]
     fn test_highlight_map() {

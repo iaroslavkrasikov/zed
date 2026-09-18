@@ -59,6 +59,9 @@ pub struct ProjectSettingsContent {
     #[serde(default)]
     pub lsp: LspSettingsMap,
 
+    /// Common language server settings.
+    pub global_lsp_settings: Option<GlobalLspSettingsContent>,
+
     pub terminal: Option<ProjectTerminalSettingsContent>,
 
     /// Configuration for Debugger-related features
@@ -91,6 +94,7 @@ crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
         terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        global_lsp_settings,
     },
     defaults: { lsp, dap, context_servers },
 });
@@ -252,6 +256,18 @@ pub struct FetchSettings {
 #[with_fallible_options]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct GlobalLspSettingsContent {
+    /// Automatically install missing Zed-managed language servers.
+    ///
+    /// Default: `true`
+    pub auto_install: Option<bool>,
+    /// Automatically update Zed-managed language servers.
+    ///
+    /// Default: `true`
+    pub auto_update: Option<bool>,
+    /// Automatically start language servers when opening files.
+    ///
+    /// Default: `true`
+    pub auto_start: Option<bool>,
     /// Whether to show the LSP servers button in the status bar.
     ///
     /// Default: `true`
