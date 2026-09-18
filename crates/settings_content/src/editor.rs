@@ -1071,7 +1071,7 @@ pub struct DragAndDropSelectionContent {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ShowMinimap {
-    /// Follow the visibility of the scrollbar.
+    /// Show the minimap on hover.
     Auto,
     /// Always show the minimap.
     Always,

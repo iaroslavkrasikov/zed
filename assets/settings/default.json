@@ -673,7 +673,7 @@
   "minimap": {
     // When to show the minimap in the editor.
     // This setting can take three values:
-    // 1. Show the minimap if the editor's scrollbar is visible:
+    // 1. Show the minimap on hover:
     //    "auto"
     // 2. Always show the minimap:
     //    "always"
